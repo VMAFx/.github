@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest a new feature or improvement
+title: "feat: "
+labels: ["type:feature", "triage"]
+body:
+  - type: textarea
+    attributes:
+      label: Problem
+      description: What problem are you trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Proposed solution
+      description: How would you like this to work?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you ruled out + why.

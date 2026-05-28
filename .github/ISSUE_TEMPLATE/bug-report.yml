@@ -1,0 +1,34 @@
+name: Bug report
+description: Report a bug in VMAFx (the library, tooling, or container)
+title: "bug: "
+labels: ["type:bug", "triage"]
+body:
+  - type: textarea
+    attributes:
+      label: What happened?
+      description: Describe what you expected to happen vs what actually happened.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Reproducer
+      description: Exact command(s) and inputs to reproduce.
+      render: bash
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: VMAFx version
+      placeholder: "e.g. vmafx-3.0.1-lusoris.4 (`vmafx --version`)"
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Environment
+      options:
+        - Docker image (ghcr.io/vmafx/vmafx)
+        - Helm chart on Kubernetes
+        - Local build from source
+        - Dev container
+    validations:
+      required: true
