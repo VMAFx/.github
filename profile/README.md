@@ -1,24 +1,48 @@
+<div align="center">
+
 # VMAFx
 
-**Modernized perceptual video quality assessment.**
+**Perceptual video quality assessment that gives the same score on every device.**
 
-A cloud-native fork-descended-from Netflix VMAF, rebuilt for distributed video pipelines: GPU-vendor-agnostic backends, tiny-AI models for one-shot scoring, MCP server for AI-agent integrations, Kubernetes-native deployment with a 3-vendor GPU device-plugin matrix.
+[![Latest release](https://img.shields.io/github/v/release/VMAFx/vmafx?include_prereleases&sort=semver&label=latest%20release)](https://github.com/VMAFx/vmafx/releases)
+[![Tests](https://img.shields.io/github/actions/workflow/status/VMAFx/vmafx/tests-and-quality-gates.yml?branch=master&event=push&label=tests)](https://github.com/VMAFx/vmafx/actions/workflows/tests-and-quality-gates.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/VMAFx/vmafx/badge)](https://scorecard.dev/viewer/?uri=github.com/VMAFx/vmafx)
+[![OpenSSF Best Practices](https://img.shields.io/cii/level/14549?label=OpenSSF%20best%20practices)](https://www.bestpractices.dev/projects/14549)
+[![Discussions](https://img.shields.io/github/discussions/VMAFx/vmafx?label=discussions)](https://github.com/VMAFx/vmafx/discussions)
+[![Last commit](https://img.shields.io/github/last-commit/VMAFx/vmafx/master?label=last%20commit)](https://github.com/VMAFx/vmafx/commits/master)
 
-## What's here
+**[📖 Docs](https://vmafx.github.io/vmafx/)** · **[🗺️ Roadmap](https://vmafx.github.io/vmafx/roadmap/)** · **[🚀 First score](https://vmafx.github.io/vmafx/getting-started/first-score/)** · **[💬 Discussions](https://github.com/VMAFx/vmafx/discussions)**
 
-- **[vmafx](https://github.com/VMAFx/vmafx)** — the main repo: core C++23 library (`libvmaf` C ABI being retired), Go production tooling, Rust pilots, Python ML training, Helm chart, dev container.
+</div>
 
-## Core principles
+VMAFx is a fork of [Netflix/vmaf](https://github.com/Netflix/vmaf). Netflix's own reference tests run on every change, so the CPU scores stay the reference scores. On top of that, VMAFx scores on GPUs from every major vendor and holds each GPU version of a metric to the CPU's result **bit for bit**, with the evidence published.
 
-- **Cloud-native first.** Production artifacts are Docker images + Helm chart. Native `.so` / `.deb` / `.rpm` publishing is out of scope — Docker is the platform.
-- **Multi-vendor GPU.** First-class support for NVIDIA (CUDA), AMD (HIP / ROCm), Intel (SYCL / Arc).
-- **Correctness above speed.** Bit-exactness against the Netflix CPU reference is the non-negotiable safety net.
-- **Multi-language, multi-purpose.** Go for production tooling (controller / node / Operator / CLI / MCP), Rust for pilot integrations + bindings, Python for ML training, C++23 internals for the scoring core.
+## Repositories
 
-## License
+| Repository | What it is |
+| --- | --- |
+| [**vmafx**](https://github.com/VMAFx/vmafx) | The scoring library, CLI, FFmpeg integration, server and tooling: CUDA, SYCL, HIP and Metal backends, SIMD paths, containers and Helm. |
+| [**pelorus**](https://github.com/VMAFx/pelorus) | Encoder-side companion: a GPU pre-encode pipeline and the interop VMAFx reads (side data, QP reports, encoder parameters). |
+| [**netflix-vmaf-contributions**](https://github.com/VMAFx/netflix-vmaf-contributions) | Our fork of Netflix/vmaf, used to contribute fixes back upstream. |
 
-Dual-licensed for fork-added code: **BSD-3-Clause-Plus-Patent OR MIT**. Netflix-inherited code stays under BSD-3-Clause-Plus-Patent. See the [LICENSE](https://github.com/VMAFx/vmafx/blob/master/LICENSE) and [LICENSE-MIT](https://github.com/VMAFx/vmafx/blob/master/LICENSE-MIT) on the main repo.
+## What we hold ourselves to
 
-## Status
+- **Correct before fast.** The reference scores don't move. A faster path that changes a score is a bug, not a trade-off.
+- **Every vendor, same answer.** NVIDIA, Intel, AMD and Apple GPUs, and the CPU's SIMD paths, all return the reference result, and published tables show where that is proven.
+- **Reproducible and verifiable.** Signed releases, build provenance, SBOMs, and scores that can carry a record of exactly how they were produced.
+- **Upstream-friendly.** We port Netflix's changes and keep the classic `libvmaf` API working for existing users.
 
-Active development. The fork is undergoing an aggressive modernization sweep (Phase 4) toward a distributed controller / node / operator architecture. See [ADR-0686](https://github.com/VMAFx/vmafx/blob/master/docs/adr/0686-vmafx-rebrand-aggressive-modernization.md) (rebrand umbrella) and [ADR-0709](https://github.com/VMAFx/vmafx/blob/master/docs/adr/0709-vmafx-phase4b-distributed-platform.md) (Phase 4b distributed platform).
+## Where things stand
+
+The release badge above, the [roadmap](https://vmafx.github.io/vmafx/roadmap/) and the [milestones](https://github.com/VMAFx/vmafx/milestones) are always current. This page doesn't repeat them, so it can't go stale.
+
+## Get involved
+
+- 📟 **Have a GPU or Mac we haven't tested?** Run the [tester kit](https://vmafx.github.io/vmafx/usage/tester-image/); see the [hardware we need](https://vmafx.github.io/vmafx/usage/hardware-we-need/).
+- 🙋 **Questions and ideas:** [Discussions](https://github.com/VMAFx/vmafx/discussions).
+- 🧑‍💻 **First contribution:** [good first issues](https://github.com/VMAFx/vmafx/issues?q=is%3Aopen+label%3A%22good+first+issue%22) and [help wanted](https://github.com/VMAFx/vmafx/issues?q=is%3Aopen+label%3A%22help+wanted%22); start with [CONTRIBUTING](https://github.com/VMAFx/vmafx/blob/master/CONTRIBUTING.md).
+- 🔒 **Security:** report privately through [security advisories](https://github.com/VMAFx/vmafx/security/advisories/new).
+
+## Licences
+
+Code written for VMAFx is licensed under **EUPL-1.2**. Code inherited from Netflix keeps its **BSD-2-Clause-Patent** licence. Each file's SPDX line is authoritative. Pelorus is BSD-2-Clause-Patent. See [LICENSE](https://github.com/VMAFx/vmafx/blob/master/LICENSE) and [NOTICE](https://github.com/VMAFx/vmafx/blob/master/NOTICE).
