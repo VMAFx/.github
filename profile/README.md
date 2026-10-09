@@ -45,4 +45,4 @@ The release badge above, the [roadmap](https://vmafx.github.io/vmafx/roadmap/) a
 
 ## Licences
 
-Code written for VMAFx is licensed under **EUPL-1.2**. Code inherited from Netflix keeps its **BSD-2-Clause-Patent** licence. Each file's SPDX line is authoritative. Pelorus is BSD-2-Clause-Patent. See [LICENSE](https://github.com/VMAFx/vmafx/blob/master/LICENSE) and [NOTICE](https://github.com/VMAFx/vmafx/blob/master/NOTICE).
+Code written for VMAFx is licensed under **EUPL-1.2**. Code inherited from Netflix keeps its **BSD-2-Clause-Patent** licence. Each file's SPDX line is authoritative. Pelorus is **EUPL-1.2** since v0.3.0; files it adds to FFmpeg are LGPL-2.1-or-later, and releases up to v0.2.2 stay BSD-2-Clause-Patent. See the vmafx [LICENSE](https://github.com/VMAFx/vmafx/blob/master/LICENSE) and [NOTICE](https://github.com/VMAFx/vmafx/blob/master/NOTICE), and the Pelorus [LICENSE](https://github.com/VMAFx/pelorus/blob/master/LICENSE).
