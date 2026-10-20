@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@proton.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+# Code scanning: CodeQL analyses the workflows of this repository and uploads
+# the findings to the forge's code scanning. The actions language needs no
+# build. The job is no required check; it runs on a pull request that changes
+# a workflow, on master, once a week and by hand.
+name: Code scanning
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - .github/workflows/**
+  push:
+    branches: [master]
+  schedule:
+    - cron: "41 3 * * 2"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: CodeQL
+    if: github.event.pull_request.draft != true
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write # the findings go to the forge's code scanning
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up CodeQL
+        uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          languages: actions
+          build-mode: none
+
+      - name: Analyse and upload the findings
+        uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
