@@ -8,11 +8,27 @@ repository:
   homepage: ""
   topics: []
   default_branch: master
+# Organisation community health files (CONTRIBUTING, pull request template, security policy) stay as the
+# organisation wrote them; adoption writes none of them here (answer praetor-adoption-dotgithub).
+adoption:
+  decline:
+    - contributing
+    - pull-request-template
+    - security-policy
 profiles:
   - template-seed
 facets:
   - security:high
   - agent:sandboxed
+# Solo-maintained organisation repository: one maintainer, no second reviewer; the operator's bypass stays at
+# pull-request mode (standing solo-repository ruleset policy, owner-approved 2026-10-09).
+overrides:
+  branch_protection:
+    enforce_linear_history: true
+    require_signed_commits: true
+    required_approving_reviewers: 1
+    review_mode: single_maintainer
+    dismiss_stale_reviews: true
 register:
   sources:
     expected: 13
