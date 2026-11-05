@@ -21,9 +21,9 @@
   <!-- 6 support -->
   [![Discussions](https://img.shields.io/badge/Support-Discussions-8b5cf6?style=for-the-badge&logo=github&labelColor=111a35)](https://github.com/VMAFx/vmafx/discussions)
 
-  **Perceptual video quality assessment that gives the same score on every device.**
+  **Perceptual video quality assessment that gives the [same score on every device](https://github.com/VMAFx/vmafx/blob/master/docs/development/cross-backend-gate.md).**
 
-  _A fork of [Netflix/vmaf](https://github.com/Netflix/vmaf) that keeps the reference scores_
+  _A fork of [Netflix/vmaf](https://github.com/Netflix/vmaf) that [keeps the reference scores](https://github.com/VMAFx/vmafx/blob/master/docs/principles.md#31-netflix-golden-data-gate)_
 
 </div>
 
