@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 TOP_LEVEL_KEYS = ("name", "target", "enforcement", "conditions", "bypass_actors")
+HISTORY_PAGE = 100
 
 
 class GhError(Exception):
@@ -97,6 +98,43 @@ def fetch_ruleset(gh: Callable[..., str], repo: str, ruleset_id: int) -> dict[st
     if not isinstance(data, dict):
         raise GhError(f"unexpected ruleset payload type: {type(data).__name__}")
     return data
+
+
+def fetch_history_ids(gh: Callable[..., str], repo: str, ruleset_id: int) -> set[int]:
+    """Return the version ids on the first page of the ruleset history."""
+    path = f"repos/{repo}/rulesets/{ruleset_id}/history?per_page={HISTORY_PAGE}"
+    data = json.loads(gh(["api", path]))
+    if not isinstance(data, list):
+        raise GhError(f"unexpected ruleset history payload type: {type(data).__name__}")
+    ids: set[int] = set()
+    for entry in data:
+        version = entry.get("version_id") if isinstance(entry, dict) else None
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise GhError("ruleset history entry without an integer version_id")
+        ids.add(version)
+    return ids
+
+
+def concurrent_write_errors(
+    repo: str, ruleset_id: int, before: set[int], after: set[int]
+) -> list[str]:
+    """Return errors unless the write added exactly one history version."""
+    new = sorted(after - before)
+    if len(new) == 1:
+        return []
+    if new:
+        found = ", ".join(str(version) for version in new)
+        reason = (
+            f"ruleset history shows {len(new)} new versions ({found}) where this "
+            "write adds one: another client changed the ruleset during the apply"
+        )
+    else:
+        reason = "ruleset history shows no new version after the write"
+    return [
+        f"{reason}; inspect each version with gh api "
+        f"repos/{repo}/rulesets/{ruleset_id}/history/<version_id>, restore the "
+        "intended state, then re-run"
+    ]
 
 
 def find_ruleset_id(entries: list[dict[str, Any]], name: str) -> int | None:
@@ -327,6 +365,7 @@ def _write_and_verify(
     desired: dict[str, Any],
     declared: dict[str, Any],
 ) -> int:
+    before = fetch_history_ids(gh, repo, ruleset_id)
     fresh = fetch_ruleset(gh, repo, ruleset_id)
     if _snapshot_view(fresh) != _snapshot_view(live):
         print(
@@ -337,7 +376,9 @@ def _write_and_verify(
         return 1
     _put_ruleset(gh, repo, ruleset_id, desired)
     readback = fetch_ruleset(gh, repo, ruleset_id)
-    rb_errors = readback_errors(readback, declared, live)
+    after = fetch_history_ids(gh, repo, ruleset_id)
+    rb_errors = concurrent_write_errors(repo, ruleset_id, before, after)
+    rb_errors += readback_errors(readback, declared, live)
     if rb_errors:
         for message in rb_errors:
             print(message, file=sys.stderr)

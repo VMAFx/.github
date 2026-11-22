@@ -96,6 +96,10 @@ class FakeGh:
         get_sequence: list[dict] | None = None,
         fail: Exception | None = None,
         bad_json: bool = False,
+        history: list[int] | None = None,
+        concurrent_writes: int = 0,
+        put_adds_version: bool = True,
+        bad_history: bool = False,
     ) -> None:
         self.calls: list[tuple[list[str], str | None]] = []
         if list_payload is None:
@@ -105,6 +109,10 @@ class FakeGh:
         self.get_sequence = list(get_sequence) if get_sequence is not None else [LIVE]
         self.fail = fail
         self.bad_json = bad_json
+        self.history = list(history) if history is not None else [100]
+        self.concurrent_writes = concurrent_writes
+        self.put_adds_version = put_adds_version
+        self.bad_history = bad_history
 
     def __call__(self, args: list[str], stdin: str | None = None) -> str:
         self.calls.append((list(args), stdin))
@@ -121,7 +129,30 @@ class FakeGh:
             if self.bad_json:
                 return "not json"
             return json.dumps(self.list_payload)
+        if (
+            len(args) == 2
+            and args[0] == "api"
+            and "/history?" in args[1]
+        ):
+            if self.bad_history:
+                return "{}"
+            return json.dumps(
+                [
+                    {
+                        "version_id": v,
+                        "actor": {"id": 1, "type": "User"},
+                        "updated_at": "2026-11-22T00:00:00Z",
+                    }
+                    for v in reversed(self.history)
+                ]
+            )
         if args[:3] == ["api", "-X", "PUT"] and args[-2:] == ["--input", "-"]:
+            for _ in range(self.concurrent_writes):
+                next_id = max(self.history, default=0) + 1
+                self.history.append(next_id)
+            if self.put_adds_version:
+                next_id = max(self.history, default=0) + 1
+                self.history.append(next_id)
             return "{}"
         if (
             len(args) == 2
@@ -188,6 +219,94 @@ class ApplyRulesetTests(unittest.TestCase):
                 pull["parameters"]["require_extra_approval_for_unattributed_changes"]
             )
             self.assertIn("declared rules match", out)
+
+    def test_apply_reads_history_around_the_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_json(tmp, "ruleset.json", DECLARED)
+            gh = FakeGh(get_sequence=[LIVE, LIVE, merged_live()])
+            rc, _, err = run_main(
+                ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
+                gh,
+            )
+            self.assertEqual(rc, 0, msg=err)
+            history_calls = [
+                i
+                for i, (args, _) in enumerate(gh.calls)
+                if len(args) == 2 and args[0] == "api" and "/history?" in args[1]
+            ]
+            self.assertEqual(history_calls, [2, 6])
+            ruleset_gets = [
+                i
+                for i, (args, _) in enumerate(gh.calls)
+                if len(args) == 2
+                and args[0] == "api"
+                and "/rulesets/" in args[1]
+                and "?" not in args[1]
+            ]
+            put_idx = next(
+                i for i, (args, _) in enumerate(gh.calls) if args[:3] == ["api", "-X", "PUT"]
+            )
+            self.assertLess(history_calls[0], ruleset_gets[1])
+            self.assertGreater(history_calls[1], put_idx)
+
+    def test_concurrent_write_during_apply_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_json(tmp, "ruleset.json", DECLARED)
+            gh = FakeGh(
+                get_sequence=[LIVE, LIVE, merged_live()],
+                concurrent_writes=1,
+            )
+            rc, _, err = run_main(
+                ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
+                gh,
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("2 new versions", err)
+            self.assertIn("101", err)
+            self.assertIn("102", err)
+            self.assertIn("another client", err)
+            self.assertIn("history/<version_id>", err)
+
+    def test_write_without_new_history_version_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_json(tmp, "ruleset.json", DECLARED)
+            gh = FakeGh(
+                get_sequence=[LIVE, LIVE, merged_live()],
+                put_adds_version=False,
+            )
+            rc, _, err = run_main(
+                ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
+                gh,
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("no new version", err)
+
+    def test_unreadable_history_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_json(tmp, "ruleset.json", DECLARED)
+            gh = FakeGh(get_sequence=[LIVE, LIVE, merged_live()], bad_history=True)
+            rc, _, err = run_main(
+                ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
+                gh,
+            )
+            self.assertEqual(rc, 1)
+            self.assertNotEqual(err, "")
+            puts = [call for call in gh.calls if call[0][:3] == ["api", "-X", "PUT"]]
+            self.assertEqual(puts, [])
+
+    def test_dry_run_reads_no_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_json(tmp, "ruleset.json", DECLARED)
+            gh = FakeGh()
+            rc, _, _ = run_main(
+                ["--repo", "VMAFx/.github", "--file", str(path)],
+                gh,
+            )
+            self.assertEqual(rc, 0)
+            history_calls = [
+                call for call in gh.calls if "/history" in call[0][1]
+            ]
+            self.assertEqual(history_calls, [])
 
     def test_live_only_rule_is_kept(self) -> None:
         live = json.loads(json.dumps(LIVE))

@@ -34,11 +34,16 @@ any value from the declared file did not take effect.
 - Before writing, the script reads the ruleset again and exits with status 1
   without writing when the live ruleset changed since the first read. After a
   write, it also fails when a live-only rule, or a live-only parameter of any
-  rule, did not survive the read-back. A change made in the moment between that
-  second read and the write is not detected, because the GitHub REST API does
-  not support conditional `PUT` requests (GitHub Docs, "Best practices for
-  using the REST API", section "Use conditional requests"), so run the apply
-  step from one place at a time.
+  rule, did not survive the read-back. The GitHub REST API does not support
+  conditional `PUT` requests (GitHub Docs, "Best practices for using the REST
+  API", section "Use conditional requests"), so a write by another client, the
+  GitHub web UI included, between that second read and the write cannot be
+  prevented. The script detects it instead: it reads the ruleset history
+  (`GET /repos/{owner}/{repo}/rulesets/{ruleset_id}/history`) before the second
+  read and again after the read-back, and exits with status 1 unless exactly
+  one new version appeared, listing the new version ids. Each version's full
+  state is at `GET /repos/{owner}/{repo}/rulesets/{ruleset_id}/history/{version_id}`;
+  compare it with the declared file and restore the intended state.
 - You need the `gh` CLI authenticated with administration permission on the
   repository.
 - Tests: `python3 -B -m unittest discover -s tests/ruleset -t .`
