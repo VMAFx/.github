@@ -123,7 +123,12 @@ class FakeGh:
             return json.dumps(self.list_payload)
         if args[:3] == ["api", "-X", "PUT"] and args[-2:] == ["--input", "-"]:
             return "{}"
-        if len(args) == 2 and args[0] == "api" and "/rulesets/" in args[1] and "?" not in args[1]:
+        if (
+            len(args) == 2
+            and args[0] == "api"
+            and "/rulesets/" in args[1]
+            and "?" not in args[1]
+        ):
             if not self.get_sequence:
                 raise AssertionError(f"unexpected ruleset GET: {args!r}")
             return json.dumps(self.get_sequence.pop(0))
@@ -165,7 +170,7 @@ class ApplyRulesetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = write_json(tmp, "ruleset.json", DECLARED)
             merged = merged_live()
-            gh = FakeGh(get_sequence=[LIVE, merged])
+            gh = FakeGh(get_sequence=[LIVE, LIVE, merged])
             rc, out, err = run_main(
                 ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
                 gh,
@@ -176,8 +181,12 @@ class ApplyRulesetTests(unittest.TestCase):
             payload = json.loads(puts[0][1] or "{}")
             types = {rule["type"] for rule in payload["rules"]}
             self.assertIn("copilot_code_review", types)
-            pull = next(rule for rule in payload["rules"] if rule["type"] == "pull_request")
-            self.assertTrue(pull["parameters"]["require_extra_approval_for_unattributed_changes"])
+            pull = next(
+                rule for rule in payload["rules"] if rule["type"] == "pull_request"
+            )
+            self.assertTrue(
+                pull["parameters"]["require_extra_approval_for_unattributed_changes"]
+            )
             self.assertIn("declared rules match", out)
 
     def test_live_only_rule_is_kept(self) -> None:
@@ -186,7 +195,7 @@ class ApplyRulesetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = write_json(tmp, "ruleset.json", DECLARED)
             merged = apply_ruleset.merge_ruleset(live, DECLARED)
-            gh = FakeGh(get_sequence=[live, merged])
+            gh = FakeGh(get_sequence=[live, live, merged])
             rc, out, err = run_main(
                 ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
                 gh,
@@ -215,7 +224,7 @@ class ApplyRulesetTests(unittest.TestCase):
     def test_readback_mismatch_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = write_json(tmp, "ruleset.json", DECLARED)
-            gh = FakeGh(get_sequence=[LIVE, LIVE])
+            gh = FakeGh(get_sequence=[LIVE, LIVE, LIVE])
             rc, _, err = run_main(
                 ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
                 gh,
@@ -277,6 +286,112 @@ class ApplyRulesetTests(unittest.TestCase):
             )
             self.assertEqual(rc, 1)
             self.assertIn("list failed", err)
+
+    def test_live_change_since_snapshot_writes_nothing(self) -> None:
+        snapshot = json.loads(json.dumps(LIVE))
+        snapshot["rules"] = [
+            r for r in snapshot["rules"] if r["type"] != "required_signatures"
+        ]
+        re_read = json.loads(json.dumps(LIVE))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_json(tmp, "ruleset.json", DECLARED)
+            gh = FakeGh(get_sequence=[snapshot, re_read])
+            rc, _, err = run_main(
+                ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
+                gh,
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("changed since it was read", err)
+            puts = [call for call in gh.calls if call[0][:3] == ["api", "-X", "PUT"]]
+            self.assertEqual(puts, [])
+
+    def test_live_change_in_top_level_field_writes_nothing(self) -> None:
+        re_read = json.loads(json.dumps(LIVE))
+        re_read["bypass_actors"] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_json(tmp, "ruleset.json", DECLARED)
+            gh = FakeGh(get_sequence=[LIVE, re_read])
+            rc, _, err = run_main(
+                ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
+                gh,
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("changed since it was read", err)
+            puts = [call for call in gh.calls if call[0][:3] == ["api", "-X", "PUT"]]
+            self.assertEqual(puts, [])
+
+    def test_readback_missing_live_only_rule_fails(self) -> None:
+        live = json.loads(json.dumps(LIVE))
+        live["rules"].append({"type": "creation"})
+        readback = json.loads(json.dumps(live))
+        readback["rules"] = [r for r in readback["rules"] if r["type"] != "creation"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_json(tmp, "ruleset.json", DECLARED)
+            gh = FakeGh(get_sequence=[live, live, readback])
+            rc, _, err = run_main(
+                ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
+                gh,
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn(
+                "live-only rule from the snapshot missing after read-back", err
+            )
+
+    def test_readback_changed_live_only_parameters_fails(self) -> None:
+        live = json.loads(json.dumps(LIVE))
+        live["rules"].append(
+            {
+                "type": "creation",
+                "parameters": {"enabled": True},
+            }
+        )
+        readback = json.loads(json.dumps(live))
+        creation = next(r for r in readback["rules"] if r["type"] == "creation")
+        creation["parameters"] = {"enabled": False}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_json(tmp, "ruleset.json", DECLARED)
+            gh = FakeGh(get_sequence=[live, live, readback])
+            rc, _, err = run_main(
+                ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
+                gh,
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("live-only parameters changed after read-back", err)
+
+    def test_readback_lost_live_only_parameter_on_declared_rule_fails(self) -> None:
+        readback = merged_live()
+        pull_request = next(r for r in readback["rules"] if r["type"] == "pull_request")
+        del pull_request["parameters"][
+            "require_extra_approval_for_unattributed_changes"
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_json(tmp, "ruleset.json", DECLARED)
+            gh = FakeGh(get_sequence=[LIVE, LIVE, readback])
+            rc, _, err = run_main(
+                ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
+                gh,
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn(
+                "rule pull_request: live-only parameter "
+                "require_extra_approval_for_unattributed_changes changed after read-back",
+                err,
+            )
+
+    def test_server_metadata_change_still_writes(self) -> None:
+        re_read = {**LIVE, "id": 99, "updated_at": "2026-01-01T00:00:00Z"}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_json(tmp, "ruleset.json", DECLARED)
+            merged = merged_live()
+            gh = FakeGh(get_sequence=[LIVE, re_read, merged])
+            rc, out, err = run_main(
+                ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
+                gh,
+            )
+            self.assertEqual(rc, 0, msg=err)
+            puts = [call for call in gh.calls if call[0][:3] == ["api", "-X", "PUT"]]
+            self.assertEqual(len(puts), 1)
+            self.assertIn("declared rules match", out)
 
     def test_malformed_file_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

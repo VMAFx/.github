@@ -109,7 +109,9 @@ def find_ruleset_id(entries: list[dict[str, Any]], name: str) -> int | None:
     return ruleset_id
 
 
-def _merged_rule(live_rule: dict[str, Any], file_rule: dict[str, Any]) -> dict[str, Any]:
+def _merged_rule(
+    live_rule: dict[str, Any], file_rule: dict[str, Any]
+) -> dict[str, Any]:
     merged: dict[str, Any] = {"type": file_rule["type"]}
     live_params = live_rule.get("parameters")
     file_params = file_rule.get("parameters")
@@ -186,8 +188,66 @@ def differences(live: dict[str, Any], desired: dict[str, Any]) -> list[str]:
     return _top_level_diffs(live, desired) + _rule_diffs(live, desired)
 
 
-def readback_errors(readback: dict[str, Any], declared: dict[str, Any]) -> list[str]:
-    """Verify read-back matches every declared top-level field and file rule parameter."""
+def _snapshot_view(ruleset: dict[str, Any]) -> dict[str, Any]:
+    view: dict[str, Any] = {key: ruleset.get(key) for key in TOP_LEVEL_KEYS}
+    view["rules"] = ruleset.get("rules", [])
+    return view
+
+
+def _rule_params(rule: dict[str, Any]) -> dict[str, Any]:
+    params = rule.get("parameters", {})
+    return params if isinstance(params, dict) else {}
+
+
+def _live_only_readback_errors(
+    readback_map: dict[str, dict[str, Any]],
+    declared: dict[str, Any],
+    live: dict[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    declared_types = {rule["type"] for rule in declared.get("rules", [])}
+    for rule in live.get("rules", []):
+        rule_type = rule.get("type")
+        if not isinstance(rule_type, str) or rule_type in declared_types:
+            continue
+        if rule_type not in readback_map:
+            errors.append(
+                f"rule {rule_type}: live-only rule from the snapshot missing after read-back"
+            )
+            continue
+        if _rule_params(readback_map[rule_type]) != _rule_params(rule):
+            errors.append(
+                f"rule {rule_type}: live-only parameters changed after read-back"
+            )
+    return errors
+
+
+def _live_only_param_errors(
+    readback_map: dict[str, dict[str, Any]],
+    declared: dict[str, Any],
+    live: dict[str, Any],
+) -> list[str]:
+    """Report snapshot parameters the file omits on a declared rule that the write lost."""
+    errors: list[str] = []
+    live_map = _rules_by_type(live.get("rules", []))
+    for rule in declared.get("rules", []):
+        rule_type = rule["type"]
+        if rule_type not in live_map or rule_type not in readback_map:
+            continue
+        file_params = _rule_params(rule)
+        rb_params = _rule_params(readback_map[rule_type])
+        for param, expected in _rule_params(live_map[rule_type]).items():
+            if param not in file_params and rb_params.get(param) != expected:
+                errors.append(
+                    f"rule {rule_type}: live-only parameter {param} changed after read-back"
+                )
+    return errors
+
+
+def readback_errors(
+    readback: dict[str, Any], declared: dict[str, Any], live: dict[str, Any]
+) -> list[str]:
+    """Verify read-back matches declared fields, file rules, and live-only snapshot rules."""
     errors: list[str] = []
     for key in TOP_LEVEL_KEYS:
         if readback.get(key) != declared.get(key):
@@ -198,15 +258,13 @@ def readback_errors(readback: dict[str, Any], declared: dict[str, Any]) -> list[
         if rule_type not in readback_map:
             errors.append(f"rule {rule_type}: missing after read-back")
             continue
-        file_params = rule.get("parameters", {})
-        if not isinstance(file_params, dict):
-            file_params = {}
-        rb_params = readback_map[rule_type].get("parameters", {})
-        if not isinstance(rb_params, dict):
-            rb_params = {}
+        file_params = _rule_params(rule)
+        rb_params = _rule_params(readback_map[rule_type])
         for param, expected in file_params.items():
             if rb_params.get(param) != expected:
                 errors.append(f"rule {rule_type}: parameter {param} read-back mismatch")
+    errors.extend(_live_only_readback_errors(readback_map, declared, live))
+    errors.extend(_live_only_param_errors(readback_map, declared, live))
     return errors
 
 
@@ -222,7 +280,10 @@ def _put_ruleset(
     gh: Callable[..., str], repo: str, ruleset_id: int, desired: dict[str, Any]
 ) -> None:
     payload = json.dumps(desired)
-    gh(["api", "-X", "PUT", f"repos/{repo}/rulesets/{ruleset_id}", "--input", "-"], payload)
+    gh(
+        ["api", "-X", "PUT", f"repos/{repo}/rulesets/{ruleset_id}", "--input", "-"],
+        payload,
+    )
 
 
 def _load_declared_or_report(path: Path) -> dict[str, Any] | None:
@@ -262,12 +323,21 @@ def _write_and_verify(
     gh: Callable[..., str],
     repo: str,
     ruleset_id: int,
+    live: dict[str, Any],
     desired: dict[str, Any],
     declared: dict[str, Any],
 ) -> int:
+    fresh = fetch_ruleset(gh, repo, ruleset_id)
+    if _snapshot_view(fresh) != _snapshot_view(live):
+        print(
+            f"live ruleset {declared['name']} ({ruleset_id}) changed since it was read; "
+            "nothing written; re-run to merge against the current state",
+            file=sys.stderr,
+        )
+        return 1
     _put_ruleset(gh, repo, ruleset_id, desired)
     readback = fetch_ruleset(gh, repo, ruleset_id)
-    rb_errors = readback_errors(readback, declared)
+    rb_errors = readback_errors(readback, declared, live)
     if rb_errors:
         for message in rb_errors:
             print(message, file=sys.stderr)
@@ -278,7 +348,9 @@ def _write_and_verify(
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Apply a declared GitHub ruleset JSON file.")
+    parser = argparse.ArgumentParser(
+        description="Apply a declared GitHub ruleset JSON file."
+    )
     parser.add_argument(
         "--file",
         default=".github/rulesets/main.json",
@@ -313,14 +385,16 @@ def main(argv: list[str], gh: Callable[..., str] = run_gh) -> int:
         desired = merge_ruleset(live, declared)
         diff_lines = differences(live, desired)
         if not diff_lines:
-            print(f"live ruleset {declared['name']} ({ruleset_id}) already matches {path}")
+            print(
+                f"live ruleset {declared['name']} ({ruleset_id}) already matches {path}"
+            )
             return 0
         for line in diff_lines:
             print(line)
         if not args.apply:
             print("dry run: rerun with --apply to write these changes")
             return 0
-        return _write_and_verify(gh, repo, ruleset_id, desired, declared)
+        return _write_and_verify(gh, repo, ruleset_id, live, desired, declared)
     except (GhError, json.JSONDecodeError) as exc:
         print(exc, file=sys.stderr)
         return 1

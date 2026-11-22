@@ -31,6 +31,14 @@ any value from the declared file did not take effect.
 - Rules and rule parameters that exist only on the live GitHub ruleset are
   kept. The apply step adds or updates what the file declares without
   weakening stricter live settings that the file omits.
+- Before writing, the script reads the ruleset again and exits with status 1
+  without writing when the live ruleset changed since the first read. After a
+  write, it also fails when a live-only rule, or a live-only parameter of any
+  rule, did not survive the read-back. A change made in the moment between that
+  second read and the write is not detected, because the GitHub REST API does
+  not support conditional `PUT` requests (GitHub Docs, "Best practices for
+  using the REST API", section "Use conditional requests"), so run the apply
+  step from one place at a time.
 - You need the `gh` CLI authenticated with administration permission on the
   repository.
 - Tests: `python3 -B -m unittest discover -s tests/ruleset -t .`
