@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@proton.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+# Claim check: Vale lints the organisation profile for absolute claims and
+# proves its rule against the planted fixtures in tests/claims/
+# (docs/adr/0001-absolute-claim-check.md). The job is no required check; it
+# runs on a pull request or master push that changes the profile, the style,
+# the fixtures, the script or this workflow, and by hand.
+name: Claim check
+
+on:
+  pull_request:
+    paths:
+      - "profile/**"
+      - ".vale.ini"
+      - ".vale/**"
+      - "tests/claims/**"
+      - "scripts/check-claims.sh"
+      - ".github/workflows/claims.yml"
+  push:
+    branches:
+      - master
+    paths:
+      - "profile/**"
+      - ".vale.ini"
+      - ".vale/**"
+      - "tests/claims/**"
+      - "scripts/check-claims.sh"
+      - ".github/workflows/claims.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: claims-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  claims:
+    name: Claim check
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Lint the profile and prove the rule
+        uses: docker://jdkato/vale:v3.26.0@sha256:d4ebc402b255dacc759c468ed8c91bd5be82918bbb59583558539f3be80f1f01
+        with:
+          entrypoint: /bin/sh
+          args: scripts/check-claims.sh

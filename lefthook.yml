@@ -46,6 +46,10 @@ pre-commit:
       run: sh .config/lefthook/engine.sh compile-context --verify
     hiss-audit:
       run: sh .config/lefthook/engine.sh audit --offline
+    claims:
+      # Absolute-claim check on the profile (docs/adr/0001-absolute-claim-check.md).
+      glob: "{profile/*.md,.vale.ini,.vale/**,tests/claims/*.md,scripts/check-claims.sh}"
+      run: sh scripts/check-claims.sh
 
 post-commit:
   commands:

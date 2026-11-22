@@ -8,3 +8,4 @@ record that supersedes it.
 | Number | Date | Title | Status |
 | :--- | :--- | :--- | :--- |
 | [0000](0000-template.md) | 2026-09-11 | ADR template | Accepted |
+| [0001](0001-absolute-claim-check.md) | 2026-11-22 | Absolute-claim check on the organisation profile | Accepted |
