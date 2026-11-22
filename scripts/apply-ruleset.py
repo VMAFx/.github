@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@proton.me>
+# SPDX-License-Identifier: EUPL-1.2
+"""Apply the declared branch ruleset in .github/rulesets/ to GitHub.
+
+Operational detail lives in docs/rulesets.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Callable
+
+TOP_LEVEL_KEYS = ("name", "target", "enforcement", "conditions", "bypass_actors")
+
+
+class GhError(Exception):
+    """``gh`` exited non-zero."""
+
+
+def run_gh(args: list[str], stdin: str | None = None) -> str:
+    """Run ``gh`` with a bounded wait and return stdout."""
+    cmd = ["gh", *args]
+    result = subprocess.run(
+        cmd,
+        input=stdin,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise GhError(f"command: {cmd!r}\nstderr: {result.stderr.strip()}")
+    return result.stdout
+
+
+def _compact(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _rules_by_type(rules: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {rule["type"]: rule for rule in rules}
+
+
+def validate_declared(data: Any) -> list[str]:
+    """Return validation error messages, or an empty list when valid."""
+    if not isinstance(data, dict):
+        return ["ruleset file must be a JSON object"]
+    errors: list[str] = []
+    for key in (*TOP_LEVEL_KEYS, "rules"):
+        if key not in data:
+            errors.append(f"ruleset file missing required key: {key}")
+    rules = data.get("rules")
+    if not isinstance(rules, list):
+        errors.append("rules must be a list")
+        return errors
+    for index, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            errors.append(f"rules[{index}] must be an object")
+            continue
+        rule_type = rule.get("type")
+        if not isinstance(rule_type, str):
+            errors.append(f"rules[{index}] must have a string type")
+    return errors
+
+
+def load_declared(path: Path) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    return json.loads(text)
+
+
+def discover_repo(gh: Callable[..., str]) -> str:
+    out = gh(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])
+    repo = out.strip()
+    if not repo:
+        raise GhError("repo view returned an empty nameWithOwner")
+    return repo
+
+
+def list_rulesets(gh: Callable[..., str], repo: str) -> list[dict[str, Any]]:
+    path = f"repos/{repo}/rulesets?includes_parents=false&per_page=100"
+    raw = gh(["api", path])
+    data = json.loads(raw)
+    if not isinstance(data, list):
+        raise GhError(f"unexpected ruleset list payload type: {type(data).__name__}")
+    return data
+
+
+def fetch_ruleset(gh: Callable[..., str], repo: str, ruleset_id: int) -> dict[str, Any]:
+    raw = gh(["api", f"repos/{repo}/rulesets/{ruleset_id}"])
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise GhError(f"unexpected ruleset payload type: {type(data).__name__}")
+    return data
+
+
+def find_ruleset_id(entries: list[dict[str, Any]], name: str) -> int | None:
+    matches = [entry for entry in entries if entry.get("name") == name]
+    if len(matches) != 1:
+        return None
+    ruleset_id = matches[0].get("id")
+    if not isinstance(ruleset_id, int):
+        return None
+    return ruleset_id
+
+
+def _merged_rule(live_rule: dict[str, Any], file_rule: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {"type": file_rule["type"]}
+    live_params = live_rule.get("parameters")
+    file_params = file_rule.get("parameters")
+    if isinstance(live_params, dict) or isinstance(file_params, dict):
+        live_map = live_params if isinstance(live_params, dict) else {}
+        file_map = file_params if isinstance(file_params, dict) else {}
+        if live_map or file_map:
+            merged["parameters"] = {**live_map, **file_map}
+    return merged
+
+
+def merge_ruleset(live: dict[str, Any], declared: dict[str, Any]) -> dict[str, Any]:
+    """Build the desired payload: file top-level fields plus merged rules."""
+    declared_map = _rules_by_type(declared["rules"])
+    live_map = _rules_by_type(live.get("rules", []))
+    merged_rules: list[dict[str, Any]] = []
+    for live_rule in live.get("rules", []):
+        rule_type = live_rule.get("type")
+        if not isinstance(rule_type, str):
+            continue
+        if rule_type in declared_map:
+            merged_rules.append(_merged_rule(live_rule, declared_map[rule_type]))
+        else:
+            merged_rules.append(live_rule)
+    present = {rule["type"] for rule in merged_rules}
+    for file_rule in declared["rules"]:
+        rule_type = file_rule["type"]
+        if rule_type not in present and rule_type not in live_map:
+            merged_rules.append(_merged_rule({}, file_rule))
+        elif rule_type not in present:
+            merged_rules.append(_merged_rule(live_map[rule_type], file_rule))
+    desired: dict[str, Any] = {key: declared[key] for key in TOP_LEVEL_KEYS}
+    desired["rules"] = merged_rules
+    return desired
+
+
+def _top_level_diffs(live: dict[str, Any], desired: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for key in TOP_LEVEL_KEYS:
+        old = live.get(key)
+        new = desired.get(key)
+        if old != new:
+            lines.append(f"{key}: {_compact(old)} -> {_compact(new)}")
+    return lines
+
+
+def _rule_diffs(live: dict[str, Any], desired: dict[str, Any]) -> list[str]:
+    live_map = _rules_by_type(live.get("rules", []))
+    desired_map = _rules_by_type(desired.get("rules", []))
+    lines: list[str] = []
+    for rule_type, desired_rule in desired_map.items():
+        if rule_type not in live_map:
+            lines.append(f"rule {rule_type}: added")
+            continue
+        live_rule = live_map[rule_type]
+        live_params = live_rule.get("parameters", {})
+        desired_params = desired_rule.get("parameters", {})
+        if not isinstance(live_params, dict):
+            live_params = {}
+        if not isinstance(desired_params, dict):
+            desired_params = {}
+        for param in sorted(set(live_params) | set(desired_params)):
+            old = live_params.get(param)
+            new = desired_params.get(param)
+            if old != new:
+                lines.append(
+                    f"rule {rule_type}: parameter {param}: {_compact(old)} -> {_compact(new)}"
+                )
+    return lines
+
+
+def differences(live: dict[str, Any], desired: dict[str, Any]) -> list[str]:
+    """Describe top-level and per-rule changes between live and desired."""
+    return _top_level_diffs(live, desired) + _rule_diffs(live, desired)
+
+
+def readback_errors(readback: dict[str, Any], declared: dict[str, Any]) -> list[str]:
+    """Verify read-back matches every declared top-level field and file rule parameter."""
+    errors: list[str] = []
+    for key in TOP_LEVEL_KEYS:
+        if readback.get(key) != declared.get(key):
+            errors.append(f"{key}: read-back does not match declared file")
+    readback_map = _rules_by_type(readback.get("rules", []))
+    for rule in declared.get("rules", []):
+        rule_type = rule["type"]
+        if rule_type not in readback_map:
+            errors.append(f"rule {rule_type}: missing after read-back")
+            continue
+        file_params = rule.get("parameters", {})
+        if not isinstance(file_params, dict):
+            file_params = {}
+        rb_params = readback_map[rule_type].get("parameters", {})
+        if not isinstance(rb_params, dict):
+            rb_params = {}
+        for param, expected in file_params.items():
+            if rb_params.get(param) != expected:
+                errors.append(f"rule {rule_type}: parameter {param} read-back mismatch")
+    return errors
+
+
+def _print_kept_live_rules(live: dict[str, Any], declared: dict[str, Any]) -> None:
+    declared_types = {rule["type"] for rule in declared.get("rules", [])}
+    for rule in live.get("rules", []):
+        rule_type = rule.get("type")
+        if isinstance(rule_type, str) and rule_type not in declared_types:
+            print(f"kept live rule not in the file: {rule_type}")
+
+
+def _put_ruleset(
+    gh: Callable[..., str], repo: str, ruleset_id: int, desired: dict[str, Any]
+) -> None:
+    payload = json.dumps(desired)
+    gh(["api", "-X", "PUT", f"repos/{repo}/rulesets/{ruleset_id}", "--input", "-"], payload)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Apply a declared GitHub ruleset JSON file.")
+    parser.add_argument(
+        "--file",
+        default=".github/rulesets/main.json",
+        help="Path to the declared ruleset JSON (default: .github/rulesets/main.json)",
+    )
+    parser.add_argument(
+        "--repo",
+        default=None,
+        help="Repository as OWNER/NAME (default: current repo from gh repo view)",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write changes; without this flag the script only reports differences",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str], gh: Callable[..., str] = run_gh) -> int:
+    args = parse_args(argv)
+    path = Path(args.file)
+    try:
+        declared = load_declared(path)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    errors = validate_declared(declared)
+    if errors:
+        for message in errors:
+            print(message, file=sys.stderr)
+        return 1
+    try:
+        repo = args.repo or discover_repo(gh)
+        entries = list_rulesets(gh, repo)
+        ruleset_id = find_ruleset_id(entries, declared["name"])
+        if ruleset_id is None:
+            names = [entry.get("name") for entry in entries if entry.get("name") == declared["name"]]
+            if not names:
+                print(
+                    f"no live ruleset named {declared['name']!r}; will not create one",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"more than one live ruleset named {declared['name']!r}; will not update",
+                    file=sys.stderr,
+                )
+            return 1
+        live = fetch_ruleset(gh, repo, ruleset_id)
+        _print_kept_live_rules(live, declared)
+        desired = merge_ruleset(live, declared)
+        diff_lines = differences(live, desired)
+        if not diff_lines:
+            print(f"live ruleset {declared['name']} ({ruleset_id}) already matches {path}")
+            return 0
+        for line in diff_lines:
+            print(line)
+        if not args.apply:
+            print("dry run: rerun with --apply to write these changes")
+            return 0
+        _put_ruleset(gh, repo, ruleset_id, desired)
+        readback = fetch_ruleset(gh, repo, ruleset_id)
+        rb_errors = readback_errors(readback, declared)
+        if rb_errors:
+            for message in rb_errors:
+                print(message, file=sys.stderr)
+            return 1
+        rule_count = len(declared.get("rules", []))
+        print(f"read-back: {rule_count} declared rules match")
+        return 0
+    except GhError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
