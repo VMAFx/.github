@@ -120,50 +120,42 @@ class FakeGh:
             raise self.fail
         if args[:4] == ["repo", "view", "--json", "nameWithOwner"]:
             return "VMAFx/.github\n"
-        if (
-            len(args) == 2
-            and args[0] == "api"
-            and args[1].startswith("repos/")
-            and "/rulesets?" in args[1]
-        ):
-            if self.bad_json:
-                return "not json"
-            return json.dumps(self.list_payload)
-        if (
-            len(args) == 2
-            and args[0] == "api"
-            and "/history?" in args[1]
-        ):
-            if self.bad_history:
-                return "{}"
-            return json.dumps(
-                [
-                    {
-                        "version_id": v,
-                        "actor": {"id": 1, "type": "User"},
-                        "updated_at": "2026-11-22T00:00:00Z",
-                    }
-                    for v in reversed(self.history)
-                ]
-            )
         if args[:3] == ["api", "-X", "PUT"] and args[-2:] == ["--input", "-"]:
-            for _ in range(self.concurrent_writes):
-                next_id = max(self.history, default=0) + 1
-                self.history.append(next_id)
-            if self.put_adds_version:
-                next_id = max(self.history, default=0) + 1
-                self.history.append(next_id)
-            return "{}"
-        if (
-            len(args) == 2
-            and args[0] == "api"
-            and "/rulesets/" in args[1]
-            and "?" not in args[1]
-        ):
+            return self._put()
+        if len(args) == 2 and args[0] == "api":
+            return self._api_get(args)
+        raise AssertionError(f"unexpected gh call: {args!r}, stdin={stdin!r}")
+
+    def _api_get(self, args: list[str]) -> str:
+        path = args[1]
+        if path.startswith("repos/") and "/rulesets?" in path:
+            return "not json" if self.bad_json else json.dumps(self.list_payload)
+        if "/history?" in path:
+            return self._history_payload()
+        if "/rulesets/" in path and "?" not in path:
             if not self.get_sequence:
                 raise AssertionError(f"unexpected ruleset GET: {args!r}")
             return json.dumps(self.get_sequence.pop(0))
-        raise AssertionError(f"unexpected gh call: {args!r}, stdin={stdin!r}")
+        raise AssertionError(f"unexpected gh call: {args!r}, stdin=None")
+
+    def _history_payload(self) -> str:
+        if self.bad_history:
+            return "{}"
+        entries = [
+            {
+                "version_id": version,
+                "actor": {"id": 1, "type": "User"},
+                "updated_at": "2026-11-22T00:00:00Z",
+            }
+            for version in reversed(self.history)
+        ]
+        return json.dumps(entries)
+
+    def _put(self) -> str:
+        added = self.concurrent_writes + (1 if self.put_adds_version else 0)
+        for _ in range(added):
+            self.history.append(max(self.history, default=0) + 1)
+        return "{}"
 
 
 def write_json(directory: str, name: str, payload: dict) -> Path:
@@ -244,7 +236,9 @@ class ApplyRulesetTests(unittest.TestCase):
                 and "?" not in args[1]
             ]
             put_idx = next(
-                i for i, (args, _) in enumerate(gh.calls) if args[:3] == ["api", "-X", "PUT"]
+                i
+                for i, (args, _) in enumerate(gh.calls)
+                if args[:3] == ["api", "-X", "PUT"]
             )
             self.assertLess(history_calls[0], ruleset_gets[1])
             self.assertGreater(history_calls[1], put_idx)
@@ -303,9 +297,7 @@ class ApplyRulesetTests(unittest.TestCase):
                 gh,
             )
             self.assertEqual(rc, 0)
-            history_calls = [
-                call for call in gh.calls if "/history" in call[0][1]
-            ]
+            history_calls = [call for call in gh.calls if "/history" in call[0][1]]
             self.assertEqual(history_calls, [])
 
     def test_live_only_rule_is_kept(self) -> None:
