@@ -12,8 +12,9 @@ import argparse
 import json
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 TOP_LEVEL_KEYS = ("name", "target", "enforcement", "conditions", "bypass_actors")
 
@@ -224,6 +225,58 @@ def _put_ruleset(
     gh(["api", "-X", "PUT", f"repos/{repo}/rulesets/{ruleset_id}", "--input", "-"], payload)
 
 
+def _load_declared_or_report(path: Path) -> dict[str, Any] | None:
+    try:
+        declared = load_declared(path)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(exc, file=sys.stderr)
+        return None
+    errors = validate_declared(declared)
+    if errors:
+        for message in errors:
+            print(message, file=sys.stderr)
+        return None
+    return declared
+
+
+def _locate_ruleset(gh: Callable[..., str], repo: str, name: str) -> int | None:
+    entries = list_rulesets(gh, repo)
+    ruleset_id = find_ruleset_id(entries, name)
+    if ruleset_id is not None:
+        return ruleset_id
+    names = [entry.get("name") for entry in entries if entry.get("name") == name]
+    if not names:
+        print(
+            f"no live ruleset named {name!r}; will not create one",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"more than one live ruleset named {name!r}; will not update",
+            file=sys.stderr,
+        )
+    return None
+
+
+def _write_and_verify(
+    gh: Callable[..., str],
+    repo: str,
+    ruleset_id: int,
+    desired: dict[str, Any],
+    declared: dict[str, Any],
+) -> int:
+    _put_ruleset(gh, repo, ruleset_id, desired)
+    readback = fetch_ruleset(gh, repo, ruleset_id)
+    rb_errors = readback_errors(readback, declared)
+    if rb_errors:
+        for message in rb_errors:
+            print(message, file=sys.stderr)
+        return 1
+    rule_count = len(declared.get("rules", []))
+    print(f"read-back: {rule_count} declared rules match")
+    return 0
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Apply a declared GitHub ruleset JSON file.")
     parser.add_argument(
@@ -247,32 +300,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str], gh: Callable[..., str] = run_gh) -> int:
     args = parse_args(argv)
     path = Path(args.file)
-    try:
-        declared = load_declared(path)
-    except (OSError, json.JSONDecodeError) as exc:
-        print(exc, file=sys.stderr)
-        return 1
-    errors = validate_declared(declared)
-    if errors:
-        for message in errors:
-            print(message, file=sys.stderr)
+    declared = _load_declared_or_report(path)
+    if declared is None:
         return 1
     try:
         repo = args.repo or discover_repo(gh)
-        entries = list_rulesets(gh, repo)
-        ruleset_id = find_ruleset_id(entries, declared["name"])
+        ruleset_id = _locate_ruleset(gh, repo, declared["name"])
         if ruleset_id is None:
-            names = [entry.get("name") for entry in entries if entry.get("name") == declared["name"]]
-            if not names:
-                print(
-                    f"no live ruleset named {declared['name']!r}; will not create one",
-                    file=sys.stderr,
-                )
-            else:
-                print(
-                    f"more than one live ruleset named {declared['name']!r}; will not update",
-                    file=sys.stderr,
-                )
             return 1
         live = fetch_ruleset(gh, repo, ruleset_id)
         _print_kept_live_rules(live, declared)
@@ -286,17 +320,8 @@ def main(argv: list[str], gh: Callable[..., str] = run_gh) -> int:
         if not args.apply:
             print("dry run: rerun with --apply to write these changes")
             return 0
-        _put_ruleset(gh, repo, ruleset_id, desired)
-        readback = fetch_ruleset(gh, repo, ruleset_id)
-        rb_errors = readback_errors(readback, declared)
-        if rb_errors:
-            for message in rb_errors:
-                print(message, file=sys.stderr)
-            return 1
-        rule_count = len(declared.get("rules", []))
-        print(f"read-back: {rule_count} declared rules match")
-        return 0
-    except GhError as exc:
+        return _write_and_verify(gh, repo, ruleset_id, desired, declared)
+    except (GhError, json.JSONDecodeError) as exc:
         print(exc, file=sys.stderr)
         return 1
 

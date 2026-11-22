@@ -6,7 +6,6 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
-import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -96,6 +95,7 @@ class FakeGh:
         list_payload: list[dict] | None = None,
         get_sequence: list[dict] | None = None,
         fail: Exception | None = None,
+        bad_json: bool = False,
     ) -> None:
         self.calls: list[tuple[list[str], str | None]] = []
         if list_payload is None:
@@ -104,6 +104,7 @@ class FakeGh:
             self.list_payload = list_payload
         self.get_sequence = list(get_sequence) if get_sequence is not None else [LIVE]
         self.fail = fail
+        self.bad_json = bad_json
 
     def __call__(self, args: list[str], stdin: str | None = None) -> str:
         self.calls.append((list(args), stdin))
@@ -111,7 +112,14 @@ class FakeGh:
             raise self.fail
         if args[:4] == ["repo", "view", "--json", "nameWithOwner"]:
             return "VMAFx/.github\n"
-        if len(args) == 2 and args[0] == "api" and args[1].startswith("repos/") and "/rulesets?" in args[1]:
+        if (
+            len(args) == 2
+            and args[0] == "api"
+            and args[1].startswith("repos/")
+            and "/rulesets?" in args[1]
+        ):
+            if self.bad_json:
+                return "not json"
             return json.dumps(self.list_payload)
         if args[:3] == ["api", "-X", "PUT"] and args[-2:] == ["--input", "-"]:
             return "{}"
@@ -169,9 +177,7 @@ class ApplyRulesetTests(unittest.TestCase):
             types = {rule["type"] for rule in payload["rules"]}
             self.assertIn("copilot_code_review", types)
             pull = next(rule for rule in payload["rules"] if rule["type"] == "pull_request")
-            self.assertTrue(
-                pull["parameters"]["require_extra_approval_for_unattributed_changes"]
-            )
+            self.assertTrue(pull["parameters"]["require_extra_approval_for_unattributed_changes"])
             self.assertIn("declared rules match", out)
 
     def test_live_only_rule_is_kept(self) -> None:
@@ -245,6 +251,19 @@ class ApplyRulesetTests(unittest.TestCase):
             )
             self.assertEqual(rc, 1)
             self.assertIn("more than one live ruleset", err)
+            puts = [call for call in gh.calls if call[0][:3] == ["api", "-X", "PUT"]]
+            self.assertEqual(puts, [])
+
+    def test_non_json_api_answer_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_json(tmp, "ruleset.json", DECLARED)
+            gh = FakeGh(bad_json=True)
+            rc, _, err = run_main(
+                ["--repo", "VMAFx/.github", "--file", str(path)],
+                gh,
+            )
+            self.assertEqual(rc, 1)
+            self.assertNotEqual(err, "")
             puts = [call for call in gh.calls if call[0][:3] == ["api", "-X", "PUT"]]
             self.assertEqual(puts, [])
 
