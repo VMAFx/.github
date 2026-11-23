@@ -97,11 +97,10 @@ class FakeGh:
         fail: Exception | None = None,
         bad_json: bool = False,
         history: list[int] | None = None,
-        foreign_writes: dict[int, list[tuple[str, dict]]] | None = None,
+        foreign_writes: dict[int, list[tuple[str, dict | None]]] | None = None,
         put_adds_version: bool = True,
         bad_history: bool = False,
         own_state_change: dict | None = None,
-        stateless_foreign: bool = False,
     ) -> None:
         self.calls: list[tuple[list[str], str | None]] = []
         if list_payload is None:
@@ -116,7 +115,6 @@ class FakeGh:
         self.put_adds_version = put_adds_version
         self.bad_history = bad_history
         self.own_state_change = own_state_change
-        self.stateless_foreign = stateless_foreign
         self.states: dict[int, dict] = {}
         self.put_count = 0
 
@@ -185,10 +183,7 @@ class FakeGh:
         entries = (self.foreign_writes or {}).get(put_index, [])
         for when, state in entries:
             if when == "before":
-                if state is None and self.stateless_foreign:
-                    self._append_version(None)
-                else:
-                    self._append_version(state)
+                self._append_version(state)
         if self.put_adds_version:
             payload = json.loads(stdin or "{}")
             own_state = {**payload, **(self.own_state_change or {})}
@@ -424,7 +419,6 @@ class ApplyRulesetTests(unittest.TestCase):
             gh = FakeGh(
                 get_sequence=[LIVE, LIVE, merged_live()],
                 foreign_writes={0: [("before", None)]},
-                stateless_foreign=True,
             )
             rc, _, err = run_main(
                 ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
