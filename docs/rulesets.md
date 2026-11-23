@@ -38,12 +38,20 @@ any value from the declared file did not take effect.
   conditional `PUT` requests (GitHub Docs, "Best practices for using the REST
   API", section "Use conditional requests"), so a write by another client, the
   GitHub web UI included, between that second read and the write cannot be
-  prevented. The script detects it instead: it reads the ruleset history
+  prevented. The script detects it instead and restores what the overlapping
+  write would lose: it reads the ruleset history
   (`GET /repos/{owner}/{repo}/rulesets/{ruleset_id}/history`) before the second
-  read and again after the read-back, and exits with status 1 unless exactly
-  one new version appeared, listing the new version ids. Each version's full
-  state is at `GET /repos/{owner}/{repo}/rulesets/{ruleset_id}/history/{version_id}`;
-  compare it with the declared file and restore the intended state.
+  read and again after the read-back. When more than one new version appeared,
+  it reads each new version's state
+  (`GET /repos/{owner}/{repo}/rulesets/{ruleset_id}/history/{version_id}`),
+  takes its own write to be the version whose state equals the payload it sent,
+  merges the one other version's state with the declared file and writes again.
+  A rule the other client added is kept and a declared rule it removed comes
+  back. It writes at most three times. It exits with status 1 and lists the
+  version ids to inspect when no new version appeared, when it cannot find its
+  own version, when more than one other version differs from its payload, or
+  when each of the three writes overlapped another write. A write by another
+  client after the final read-back is not checked; the next run reconciles it.
 - You need the `gh` CLI authenticated with administration permission on the
   repository.
 - Tests: `python3 -B -m unittest discover -s tests/ruleset -t .`

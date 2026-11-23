@@ -18,6 +18,7 @@ from typing import Any
 
 TOP_LEVEL_KEYS = ("name", "target", "enforcement", "conditions", "bypass_actors")
 HISTORY_PAGE = 100
+MAX_WRITE_ROUNDS = 3
 
 
 class GhError(Exception):
@@ -115,6 +116,14 @@ def fetch_history_ids(gh: Callable[..., str], repo: str, ruleset_id: int) -> set
     return ids
 
 
+def _history_pointer(repo: str, ruleset_id: int) -> str:
+    return (
+        f"inspect each version with gh api "
+        f"repos/{repo}/rulesets/{ruleset_id}/history/<version_id>, restore the "
+        "intended state, then re-run"
+    )
+
+
 def concurrent_write_errors(
     repo: str, ruleset_id: int, before: set[int], after: set[int]
 ) -> list[str]:
@@ -130,11 +139,69 @@ def concurrent_write_errors(
         )
     else:
         reason = "ruleset history shows no new version after the write"
-    return [
-        f"{reason}; inspect each version with gh api "
-        f"repos/{repo}/rulesets/{ruleset_id}/history/<version_id>, restore the "
-        "intended state, then re-run"
-    ]
+    return [f"{reason}; {_history_pointer(repo, ruleset_id)}"]
+
+
+def fetch_version_state(
+    gh: Callable[..., str], repo: str, ruleset_id: int, version_id: int
+) -> dict[str, Any]:
+    raw = gh(["api", f"repos/{repo}/rulesets/{ruleset_id}/history/{version_id}"])
+    data = json.loads(raw)
+    state = data.get("state") if isinstance(data, dict) else None
+    if not isinstance(state, dict):
+        raise GhError(f"ruleset history version {version_id} has no state object")
+    return state
+
+
+def _matches_payload(state: dict[str, Any], payload: dict[str, Any]) -> bool:
+    for key in TOP_LEVEL_KEYS:
+        if state.get(key) != payload.get(key):
+            return False
+    state_rules = state.get("rules", [])
+    payload_rules = payload.get("rules", [])
+    state_map = {t: _rule_params(r) for t, r in _rules_by_type(state_rules).items()}
+    payload_map = {t: _rule_params(r) for t, r in _rules_by_type(payload_rules).items()}
+    return state_map == payload_map
+
+
+def _other_version(
+    gh: Callable[..., str],
+    repo: str,
+    ruleset_id: int,
+    new_ids: list[int],
+    payload: dict[str, Any],
+) -> tuple[tuple[int, dict[str, Any]] | None, list[str]]:
+    pointer = _history_pointer(repo, ruleset_id)
+    own: list[int] = []
+    other: list[tuple[int, dict[str, Any]]] = []
+    for version_id in new_ids:
+        state = fetch_version_state(gh, repo, ruleset_id, version_id)
+        if _matches_payload(state, payload):
+            own.append(version_id)
+        else:
+            other.append((version_id, state))
+    if not own:
+        found = ", ".join(str(version) for version in new_ids)
+        return (
+            None,
+            [
+                f"cannot find this write among the new ruleset versions ({found}); "
+                f"{pointer}"
+            ],
+        )
+    if len(other) > 1:
+        found = ", ".join(str(version) for version, _ in other)
+        return (
+            None,
+            [
+                f"{len(other)} new ruleset versions from other clients ({found}) "
+                f"differ from this write; {pointer}"
+            ],
+        )
+    if not other:
+        return (None, [])
+    version_id, state = other[0]
+    return ((version_id, state), [])
 
 
 def find_ruleset_id(entries: list[dict[str, Any]], name: str) -> int | None:
@@ -357,6 +424,55 @@ def _locate_ruleset(gh: Callable[..., str], repo: str, name: str) -> int | None:
     return None
 
 
+def _finish_readback(
+    readback: dict[str, Any], declared: dict[str, Any], base: dict[str, Any]
+) -> int:
+    errors = readback_errors(readback, declared, base)
+    if errors:
+        for message in errors:
+            print(message, file=sys.stderr)
+        return 1
+    rule_count = len(declared.get("rules", []))
+    print(f"read-back: {rule_count} declared rules match")
+    return 0
+
+
+def _write_round(
+    gh: Callable[..., str],
+    repo: str,
+    ruleset_id: int,
+    declared: dict[str, Any],
+    base: dict[str, Any],
+    payload: dict[str, Any],
+    before: set[int],
+    round_num: int,
+) -> tuple[int, dict[str, Any] | None, dict[str, Any] | None, set[int] | None]:
+    _put_ruleset(gh, repo, ruleset_id, payload)
+    readback = fetch_ruleset(gh, repo, ruleset_id)
+    after = fetch_history_ids(gh, repo, ruleset_id)
+    new = sorted(after - before)
+    if len(new) == 1:
+        return (_finish_readback(readback, declared, base), None, None, None)
+    if not new:
+        for message in concurrent_write_errors(repo, ruleset_id, before, after):
+            print(message, file=sys.stderr)
+        return (1, None, None, None)
+    other, errors = _other_version(gh, repo, ruleset_id, new, payload)
+    if errors:
+        for message in errors:
+            print(message, file=sys.stderr)
+        return (1, None, None, None)
+    if other is None:
+        return (_finish_readback(readback, declared, base), None, None, None)
+    version_id, state = other
+    print(
+        f"another client wrote ruleset version {version_id} during the apply; "
+        "merged its state with the declared file and writing again "
+        f"(write {round_num + 1} of {MAX_WRITE_ROUNDS})"
+    )
+    return (2, state, merge_ruleset(state, declared), after)
+
+
 def _write_and_verify(
     gh: Callable[..., str],
     repo: str,
@@ -374,18 +490,25 @@ def _write_and_verify(
             file=sys.stderr,
         )
         return 1
-    _put_ruleset(gh, repo, ruleset_id, desired)
-    readback = fetch_ruleset(gh, repo, ruleset_id)
-    after = fetch_history_ids(gh, repo, ruleset_id)
-    rb_errors = concurrent_write_errors(repo, ruleset_id, before, after)
-    rb_errors += readback_errors(readback, declared, live)
-    if rb_errors:
-        for message in rb_errors:
-            print(message, file=sys.stderr)
-        return 1
-    rule_count = len(declared.get("rules", []))
-    print(f"read-back: {rule_count} declared rules match")
-    return 0
+    base = live
+    payload = desired
+    for round_num in range(MAX_WRITE_ROUNDS):
+        code, retry_base, retry_payload, retry_before = _write_round(
+            gh, repo, ruleset_id, declared, base, payload, before, round_num
+        )
+        if code == 2:
+            base = retry_base or base
+            payload = retry_payload or payload
+            before = retry_before or before
+            continue
+        return code
+    pointer = _history_pointer(repo, ruleset_id)
+    print(
+        f"ruleset history shows writes by other clients during each of "
+        f"{MAX_WRITE_ROUNDS} writes; {pointer}",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
