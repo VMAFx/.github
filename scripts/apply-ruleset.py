@@ -18,7 +18,7 @@ from typing import Any
 
 TOP_LEVEL_KEYS = ("name", "target", "enforcement", "conditions", "bypass_actors")
 HISTORY_PAGE = 100
-MAX_WRITE_ROUNDS = 3
+MAX_WRITE_ROUNDS = 2
 
 
 class GhError(Exception):
@@ -445,32 +445,27 @@ def _write_round(
     base: dict[str, Any],
     payload: dict[str, Any],
     before: set[int],
-    round_num: int,
-) -> tuple[int, dict[str, Any] | None, dict[str, Any] | None, set[int] | None]:
+) -> int | tuple[int, dict[str, Any], set[int]]:
+    """Return an exit code or the foreign version, its state and updated history."""
     _put_ruleset(gh, repo, ruleset_id, payload)
     readback = fetch_ruleset(gh, repo, ruleset_id)
     after = fetch_history_ids(gh, repo, ruleset_id)
     new = sorted(after - before)
     if len(new) == 1:
-        return (_finish_readback(readback, declared, base), None, None, None)
+        return _finish_readback(readback, declared, base)
     if not new:
         for message in concurrent_write_errors(repo, ruleset_id, before, after):
             print(message, file=sys.stderr)
-        return (1, None, None, None)
+        return 1
     other, errors = _other_version(gh, repo, ruleset_id, new, payload)
     if errors:
         for message in errors:
             print(message, file=sys.stderr)
-        return (1, None, None, None)
+        return 1
     if other is None:
-        return (_finish_readback(readback, declared, base), None, None, None)
+        return _finish_readback(readback, declared, base)
     version_id, state = other
-    print(
-        f"another client wrote ruleset version {version_id} during the apply; "
-        "merged its state with the declared file and writing again "
-        f"(write {round_num + 1} of {MAX_WRITE_ROUNDS})"
-    )
-    return (2, state, merge_ruleset(state, declared), after)
+    return version_id, state, after
 
 
 def _write_and_verify(
@@ -492,20 +487,25 @@ def _write_and_verify(
         return 1
     base = live
     payload = desired
-    for round_num in range(MAX_WRITE_ROUNDS):
-        code, retry_base, retry_payload, retry_before = _write_round(
-            gh, repo, ruleset_id, declared, base, payload, before, round_num
+    foreign_ids: list[int] = []
+    for write_number in range(1, MAX_WRITE_ROUNDS + 1):
+        result = _write_round(gh, repo, ruleset_id, declared, base, payload, before)
+        if isinstance(result, int):
+            return result
+        version_id, base, before = result
+        foreign_ids.append(version_id)
+        if write_number == MAX_WRITE_ROUNDS:
+            break
+        payload = merge_ruleset(base, declared)
+        print(
+            f"another client wrote ruleset version {version_id} during the apply; "
+            "merged its state with the declared file and writing again "
+            f"(write {write_number + 1} of {MAX_WRITE_ROUNDS})"
         )
-        if code == 2:
-            base = retry_base or base
-            payload = retry_payload or payload
-            before = retry_before or before
-            continue
-        return code
-    pointer = _history_pointer(repo, ruleset_id)
+    found = ", ".join(str(version) for version in foreign_ids)
     print(
-        f"ruleset history shows writes by other clients during each of "
-        f"{MAX_WRITE_ROUNDS} writes; {pointer}",
+        f"other clients wrote ruleset versions ({found}) during both writes; "
+        f"{_history_pointer(repo, ruleset_id)}",
         file=sys.stderr,
     )
     return 1

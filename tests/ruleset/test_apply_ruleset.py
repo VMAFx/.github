@@ -340,7 +340,7 @@ class ApplyRulesetTests(unittest.TestCase):
                 get_sequence=[LIVE, LIVE, foreign, merged_again],
                 foreign_writes={0: [("after", foreign)]},
             )
-            rc, out, err = run_main(
+            rc, _, err = run_main(
                 ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
                 gh,
             )
@@ -367,29 +367,48 @@ class ApplyRulesetTests(unittest.TestCase):
             puts = [c for c in gh.calls if c[0][:3] == ["api", "-X", "PUT"]]
             self.assertEqual(len(puts), 1)
 
+    def test_second_foreign_write_stops_recovery(self) -> None:
+        initial_put = merged_live()
+        first = {**LIVE, "rules": [*LIVE["rules"], {"type": "creation"}]}
+        second = {**initial_put, "rules": [*initial_put["rules"], {"type": "update"}]}
+        recovery_put = apply_ruleset.merge_ruleset(first, DECLARED)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_json(tmp, "ruleset.json", DECLARED)
+            for timing, version_id in (("before", 103), ("after", 104)):
+                with self.subTest(timing=timing):
+                    readback = recovery_put if timing == "before" else second
+                    gh = FakeGh(
+                        get_sequence=[LIVE, LIVE, initial_put, readback, second],
+                        foreign_writes={0: [("before", first)], 1: [(timing, second)]},
+                    )
+                    rc, _, err = run_main(
+                        ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
+                        gh,
+                    )
+                    self.assertEqual(rc, 1)
+                    self.assertEqual(gh.put_count, 2)
+                    self.assertIn("101", err)
+                    self.assertIn(str(version_id), err)
+                    self.assertIn("history/<version_id>", err)
+
     def test_foreign_writes_every_round_fail_closed(self) -> None:
         foreign = json.loads(json.dumps(LIVE))
         foreign["rules"].append({"type": "creation"})
         merged_after = apply_ruleset.merge_ruleset(foreign, DECLARED)
-        rounds = apply_ruleset.MAX_WRITE_ROUNDS
-        get_sequence = [LIVE, LIVE]
-        for _ in range(rounds):
-            get_sequence.extend([merged_live(), merged_after])
-        foreign_map = {n: [("before", foreign)] for n in range(rounds)}
         with tempfile.TemporaryDirectory() as tmp:
             path = write_json(tmp, "ruleset.json", DECLARED)
             gh = FakeGh(
-                get_sequence=get_sequence,
-                foreign_writes=foreign_map,
+                get_sequence=[LIVE, LIVE, merged_live(), merged_after],
+                foreign_writes={0: [("before", foreign)], 1: [("before", foreign)]},
             )
             rc, _, err = run_main(
                 ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
                 gh,
             )
             self.assertEqual(rc, 1)
-            puts = [c for c in gh.calls if c[0][:3] == ["api", "-X", "PUT"]]
-            self.assertEqual(len(puts), rounds)
-            self.assertIn(str(rounds), err)
+            self.assertEqual(gh.put_count, 2)
+            self.assertIn("101", err)
+            self.assertIn("103", err)
             self.assertIn("history/<version_id>", err)
 
     def test_own_version_not_found_fails_closed(self) -> None:

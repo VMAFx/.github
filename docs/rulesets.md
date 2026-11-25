@@ -45,13 +45,16 @@ any value from the declared file did not take effect.
   it reads each new version's state
   (`GET /repos/{owner}/{repo}/rulesets/{ruleset_id}/history/{version_id}`),
   takes its own write to be the version whose state equals the payload it sent,
-  merges the one other version's state with the declared file and writes again.
-  A rule the other client added is kept and a declared rule it removed comes
-  back. It writes at most three times. It exits with status 1 and lists the
-  version ids to inspect when no new version appeared, when it cannot find its
-  own version, when more than one other version differs from its payload, or
-  when each of the three writes overlapped another write. A write by another
-  client after the final read-back is not checked; the next run reconciles it.
+  and on the first overlap merges the other version's state with the declared
+  file and writes again. A rule the other client added is kept and a declared
+  rule it removed comes back. The script writes at most twice. If another write
+  overlaps the recovery write, it exits with status 1 and lists every foreign
+  version id for manual restoration. Merging the second state could drop a rule
+  the first writer added (see `test_second_foreign_write_stops_recovery`).
+  It exits with status 1 and lists the version ids to inspect when no new
+  version appeared, when it cannot find its own version, or when more than one
+  other version differs from its payload. A write by another client after the
+  final read-back is not checked; the next run reconciles it.
 - You need the `gh` CLI authenticated with administration permission on the
   repository.
 - Tests: `python3 -B -m unittest discover -s tests/ruleset -t .`
