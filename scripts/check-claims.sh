@@ -32,22 +32,37 @@ if [ "$rc" -ne 0 ]; then
 fi
 
 parent=${TMPDIR:-/tmp}
-if ! resolved=$(CDPATH='' cd -P "$parent" 2>/dev/null && pwd -P); then
+case "$parent" in
+  /*) ;;
+  *) parent=./$parent ;;
+esac
+if ! resolved=$(CDPATH='' cd -P -- "$parent" 2>/dev/null && pwd -P && printf x); then
   printf 'check-claims: scratch parent unreadable: %s\n' "$parent" >&2
   exit 1
 fi
-checkout=$(pwd -P)
+checkout=$(pwd -P && printf x)
+# Strip only the newline from pwd and its sentinel, preserving newlines in each path.
+resolved=${resolved%??}
+checkout=${checkout%??}
 case "$resolved/" in
   "${checkout%/}/"*)
     printf 'check-claims: scratch directory inside the checkout: %s\n' "$resolved" >&2
     exit 1
     ;;
 esac
-scratch=$(mktemp -d "$resolved/check-claims.XXXXXX")
-trap 'rm -r "$scratch"' EXIT
+scratch=
+pending=
+trap '[ -n "$scratch" ] && rm -r -- "$scratch"' EXIT
+trap 'pending=129' HUP
+trap 'pending=130' INT
+trap 'pending=143' TERM
+scratch=$(mktemp -d "$resolved/check-claims.XXXXXX") || exit 1
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+if [ -n "$pending" ]; then
+  exit "$pending"
+fi
 cp -R .vale.ini .vale "$scratch/"
 mkdir "$scratch/profile"
 readme="$scratch/profile/README.md"

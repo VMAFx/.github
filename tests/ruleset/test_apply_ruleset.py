@@ -107,10 +107,10 @@ class FakeGh:
         self,
         *,
         list_payload: list[dict] | None = None,
-        get_sequence: list[dict | list | Exception] | None = None,
+        get_sequence: list[dict | list | str | BaseException] | None = None,
         fail: Exception | None = None,
         bad_json: bool = False,
-        history_sequence: list[list[int] | Exception] | None = None,
+        history_sequence: list[list[int] | str | Exception] | None = None,
     ) -> None:
         self.calls: list[tuple[list[str], str | None]] = []
         if list_payload is None:
@@ -144,9 +144,12 @@ class FakeGh:
         endpoint, _, page = path.partition("&page=")
         if endpoint == "repos/VMAFx/.github/rulesets/7/history?per_page=100":
             versions = self.history(int(page))
+            if isinstance(versions, str):
+                return versions
             return json.dumps([{"version_id": version} for version in versions])
         if path == "repos/VMAFx/.github/rulesets/7":
-            return json.dumps(self.get())
+            body = self.get()
+            return body if isinstance(body, str) else json.dumps(body)
         raise AssertionError(f"unexpected gh call: {args!r}, stdin=None")
 
 
@@ -165,6 +168,28 @@ def run_main(
     with redirect_stdout(out), redirect_stderr(err):
         rc = apply_ruleset.main(argv, gh=gh)
     return rc, out.getvalue(), err.getvalue()
+
+
+class LoadGhJsonTests(unittest.TestCase):
+    def test_parser_failures_keep_cause(self) -> None:
+        for body, cause in (
+            ("[" * 200000, RecursionError),
+            ("1" * 5000, ValueError),
+            ("{", json.JSONDecodeError),
+        ):
+            with self.subTest(cause=cause.__name__):
+                with self.assertRaises(apply_ruleset.GhError) as raised:
+                    apply_ruleset._load_gh_json(body, "test response")
+                exc = raised.exception
+                self.assertIs(type(exc.__cause__), cause)
+                self.assertEqual(
+                    str(exc),
+                    f"test response: unparseable JSON ({cause.__name__}): "
+                    f"{exc.__cause__}",
+                )
+
+    def test_valid_object(self) -> None:
+        self.assertEqual(apply_ruleset._load_gh_json(json.dumps(LIVE), "ruleset"), LIVE)
 
 
 class ApplyRulesetTests(unittest.TestCase):
@@ -239,7 +264,7 @@ class ApplyRulesetTests(unittest.TestCase):
             self.assertLess(history_calls[0], ruleset_gets[1])
             self.assertGreater(history_calls[1], put_idx)
 
-    def assert_apply_failure(self, gh: FakeGh, reason: str, put_count: int) -> None:
+    def apply_failure_report(self, gh: FakeGh, put_count: int) -> str:
         with tempfile.TemporaryDirectory() as tmp:
             path = write_json(tmp, "ruleset.json", DECLARED)
             rc, _, err = run_main(
@@ -247,7 +272,59 @@ class ApplyRulesetTests(unittest.TestCase):
             )
         self.assertEqual(rc, 1)
         self.assertEqual(gh.put.call_count, put_count)
-        self.assertEqual(err, reason + "\n" + HISTORY_POINTER)
+        return err
+
+    def assert_apply_failure(self, gh: FakeGh, reason: str, put_count: int) -> None:
+        self.assertEqual(
+            self.apply_failure_report(gh, put_count), reason + "\n" + HISTORY_POINTER
+        )
+
+    def test_deep_readback_reports_history(self) -> None:
+        gh = FakeGh(get_sequence=[LIVE, LIVE, "[" * 200000])
+        error, report = self.apply_failure_report(gh, 1).split("\n", 1)
+        self.assertIn("read-back failed: unparseable JSON (RecursionError)", error)
+        self.assertEqual(
+            report, "ruleset history shows 1 new version (4101)\n" + HISTORY_POINTER
+        )
+
+    def test_oversized_history_integer_reports_pointer(self) -> None:
+        gh = FakeGh(
+            get_sequence=[LIVE, LIVE, merged_live()],
+            history_sequence=[[97], "1" * 5000],
+        )
+        error, pointer = self.apply_failure_report(gh, 1).split("\n", 1)
+        self.assertTrue(error.startswith("history unreadable ("), error)
+        self.assertIn("unparseable JSON (ValueError)", error)
+        self.assertEqual(pointer, HISTORY_POINTER)
+
+    def test_unexpected_readback_error_reports_history(self) -> None:
+        gh = FakeGh(get_sequence=[LIVE, LIVE, RuntimeError("lost reply")])
+        self.assert_apply_failure(
+            gh,
+            "read-back failed (RuntimeError): lost reply\n"
+            "ruleset history shows 1 new version (4101)",
+            1,
+        )
+
+    def test_unexpected_history_error_reports_pointer(self) -> None:
+        gh = FakeGh(
+            get_sequence=[LIVE, LIVE, merged_live()],
+            history_sequence=[[97], RuntimeError("lost page")],
+        )
+        self.assert_apply_failure(gh, "history unreadable (RuntimeError): lost page", 1)
+
+    def test_unexpected_put_error_reports_history(self) -> None:
+        gh = FakeGh(get_sequence=[LIVE, LIVE])
+        gh.put.side_effect = RuntimeError("lost PUT reply")
+        self.assert_apply_failure(
+            gh, "lost PUT reply\nruleset history shows 1 new version (4101)", 1
+        )
+
+    def test_readback_interrupt_propagates(self) -> None:
+        gh = FakeGh(get_sequence=[LIVE, LIVE, KeyboardInterrupt()])
+        with self.assertRaises(KeyboardInterrupt):
+            self.apply_failure_report(gh, 1)
+        gh.put.assert_called_once()
 
     def test_foreign_write_before_put_stops(self) -> None:
         gh = FakeGh(

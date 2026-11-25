@@ -19,6 +19,7 @@ from typing import Any
 TOP_LEVEL_KEYS = ("name", "target", "enforcement", "conditions", "bypass_actors")
 HISTORY_PAGE = 100
 MAX_HISTORY_PAGES = 10
+GH_JSON_ERRORS = (ValueError, RecursionError)
 
 
 class GhError(Exception):
@@ -90,10 +91,18 @@ def discover_repo(gh: Callable[..., str]) -> str:
     return repo
 
 
+def _load_gh_json(raw: str, what: str) -> Any:
+    try:
+        return json.loads(raw)
+    except GH_JSON_ERRORS as exc:
+        detail = f"{what}: unparseable JSON ({type(exc).__name__}): {exc}"
+        raise GhError(detail) from exc
+
+
 def list_rulesets(gh: Callable[..., str], repo: str) -> list[dict[str, Any]]:
     path = f"repos/{repo}/rulesets?includes_parents=false&per_page=100"
     raw = gh(["api", path])
-    data = json.loads(raw)
+    data = _load_gh_json(raw, "ruleset list")
     if not isinstance(data, list):
         raise GhError(f"unexpected ruleset list payload type: {type(data).__name__}")
     return data
@@ -103,7 +112,7 @@ def fetch_ruleset(
     gh: Callable[..., str], repo: str, ruleset_id: int, *, readback: bool = False
 ) -> dict[str, Any]:
     raw = gh(["api", f"repos/{repo}/rulesets/{ruleset_id}"])
-    data = json.loads(raw)
+    data = _load_gh_json(raw, "read-back failed" if readback else "ruleset")
     if not isinstance(data, dict):
         if readback:
             raise GhError("malformed ruleset read-back: expected an object")
@@ -120,7 +129,8 @@ def fetch_history_ids(gh: Callable[..., str], repo: str, ruleset_id: int) -> set
     path = f"repos/{repo}/rulesets/{ruleset_id}/history?per_page={HISTORY_PAGE}"
     ids: set[int] = set()
     for page in range(1, MAX_HISTORY_PAGES + 1):
-        data = json.loads(gh(["api", f"{path}&page={page}"]))
+        raw = gh(["api", f"{path}&page={page}"])
+        data = _load_gh_json(raw, f"ruleset history page {page}")
         if not isinstance(data, list):
             raise GhError(
                 f"unexpected ruleset history payload type: {type(data).__name__}"
@@ -369,17 +379,19 @@ def _history_report(
     """Return whether exactly one version appeared and the diagnostic line."""
     try:
         new = sorted(fetch_history_ids(gh, repo, ruleset_id) - before)
-    except (GhError, json.JSONDecodeError) as exc:
-        return False, f"history unreadable: {exc}"
-    if not new:
-        return (
-            False,
-            "ruleset history shows no new version since the initial history read",
-        )
-    single = len(new) == 1
-    versions = "version" if single else "versions"
-    ids = ", ".join(map(str, new))
-    return single, f"ruleset history shows {len(new)} new {versions} ({ids})"
+        if not new:
+            return (
+                False,
+                "ruleset history shows no new version since the initial history read",
+            )
+        single = len(new) == 1
+        versions = "version" if single else "versions"
+        ids = ", ".join(map(str, new))
+        return single, f"ruleset history shows {len(new)} new {versions} ({ids})"
+    except Exception as exc:  # noqa: BLE001 - keep the recovery pointer available
+        if isinstance(exc, GhError) and not isinstance(exc.__cause__, GH_JSON_ERRORS):
+            return False, f"history unreadable: {exc}"
+        return False, f"history unreadable ({type(exc).__name__}): {exc}"
 
 
 def _verify_write(
@@ -390,11 +402,14 @@ def _verify_write(
     declared: dict[str, Any],
     before: set[int],
 ) -> int:
+    # After PUT, failures must reach the history line and pointer. BaseException passes.
     try:
         readback = fetch_ruleset(gh, repo, ruleset_id, readback=True)
         errors = readback_errors(readback, declared, live)
-    except (GhError, json.JSONDecodeError) as exc:
+    except GhError as exc:
         errors = [str(exc)]
+    except Exception as exc:  # noqa: BLE001 - history still needs to be read
+        errors = [f"read-back failed ({type(exc).__name__}): {exc}"]
 
     single, history = _history_report(gh, repo, ruleset_id, before)
     if single and not errors:
@@ -416,8 +431,13 @@ def _write_and_verify(
     pointer = _history_pointer(repo, ruleset_id)
     try:
         before = fetch_history_ids(gh, repo, ruleset_id)
-    except (GhError, json.JSONDecodeError) as exc:
+    except GhError as exc:
         print(f"history unreadable: {exc}", pointer, sep="\n", file=sys.stderr)
+        return 1
+
+    def report_failure(exc: Exception) -> int:
+        _, history = _history_report(gh, repo, ruleset_id, before)
+        print(exc, history, pointer, sep="\n", file=sys.stderr)
         return 1
 
     try:
@@ -427,11 +447,13 @@ def _write_and_verify(
                 f"live ruleset {declared['name']} ({ruleset_id}) changed since it was "
                 "read; nothing written; re-run to merge against the current state"
             )
+    except GhError as exc:
+        return report_failure(exc)
+
+    try:
         _put_ruleset(gh, repo, ruleset_id, desired)
-    except (GhError, json.JSONDecodeError) as exc:
-        _, history = _history_report(gh, repo, ruleset_id, before)
-        print(exc, history, pointer, sep="\n", file=sys.stderr)
-        return 1
+    except Exception as exc:  # noqa: BLE001 - the PUT may have committed
+        return report_failure(exc)
     return _verify_write(gh, repo, ruleset_id, live, declared, before)
 
 
@@ -483,7 +505,7 @@ def main(argv: list[str], gh: Callable[..., str] = run_gh) -> int:
             print("dry run: rerun with --apply to write these changes")
             return 0
         return _write_and_verify(gh, repo, ruleset_id, live, desired, declared)
-    except (GhError, json.JSONDecodeError) as exc:
+    except GhError as exc:
         print(exc, file=sys.stderr)
         return 1
 
