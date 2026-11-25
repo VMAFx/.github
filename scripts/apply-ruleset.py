@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import traceback
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TextIO
@@ -136,6 +137,8 @@ def fetch_history_ids(gh: Callable[..., str], repo: str, ruleset_id: int) -> set
             raise GhError(
                 f"unexpected ruleset history payload type: {type(data).__name__}"
             )
+        if len(data) > HISTORY_PAGE:
+            raise GhError(f"ruleset history page {page} exceeds {HISTORY_PAGE} entries")
         for entry in data:
             version = entry.get("version_id") if isinstance(entry, dict) else None
             if not isinstance(version, int) or isinstance(version, bool):
@@ -390,7 +393,9 @@ def _describe(exc: BaseException) -> str:
             return name
 
 
-def _emit(stream: TextIO, text: str) -> bool:
+def _emit(stream: TextIO | None, text: str) -> bool:
+    if stream is None:
+        return False
     try:
         line = text + "\n"
         written = stream.write(line)
@@ -559,19 +564,38 @@ def main(argv: list[str], gh: Callable[..., str] = run_gh) -> int:
         return 1
 
 
-def _cli() -> int:
+def _exit_status(code: object) -> int:
+    if code is None:
+        return 0
+    return code if isinstance(code, int) else 1
+
+
+def _cli(argv: list[str]) -> int:
     try:
-        status = main(sys.argv[1:])
-    finally:
+        return main(argv)
+    except SystemExit as exc:
+        return _exit_status(exc.code)
+    except Exception as exc:  # noqa: BLE001 - CLI reports unexpected main failures
         try:
-            sys.stdout.flush()
-        except (OSError, ValueError):
-            # CPython retries this flush at shutdown and can replace the exit status.
-            with open(os.devnull, "w") as sink:
-                os.dup2(sink.fileno(), 1)
-            status = 1
+            detail = traceback.format_exc().rstrip("\n")
+        except Exception:  # noqa: BLE001 - traceback formatting can itself fail
+            detail = f"{_exception_name(exc)}: {_describe(exc)}"
+        _emit(sys.stderr, detail)
+        return 1
+
+
+def _settle_streams(status: int) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is None or stream.closed:
+                status = status or 1
+            else:
+                stream.flush()
+        except Exception:  # noqa: BLE001 - either stream can fail during settlement
+            status = status or 1
     return status
 
 
 if __name__ == "__main__":
-    sys.exit(_cli())
+    # Py_FinalizeEx retries failed flushes and can replace the chosen status with 120.
+    os._exit(_settle_streams(_cli(sys.argv[1:])))

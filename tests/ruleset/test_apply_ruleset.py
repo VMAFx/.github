@@ -176,8 +176,22 @@ def run_main(
     return rc, out.getvalue(), err.getvalue()
 
 
-def run_cli_with_fake_gh() -> None:
+def run_cli_with_fake_gh(scenario: str = "success") -> None:
     gh = FakeGh(get_sequence=[LIVE, LIVE, merged_live()])
+
+    def fail_put(_: str) -> None:
+        reader, writer = os.pipe()
+        os.close(reader)
+        try:
+            os.dup2(writer, 2)
+        finally:
+            os.close(writer)
+        raise apply_ruleset.GhError("lost PUT reply")
+
+    if scenario == "broken stderr":
+        gh.put.side_effect = fail_put
+    elif scenario == "unexpected error":
+        gh.fail = RuntimeError("unexpected ruleset failure")
 
     def run(
         cmd: list[str], *, input: bytes | None, **kwargs
@@ -188,6 +202,31 @@ def run_cli_with_fake_gh() -> None:
 
     with patch.object(subprocess, "run", run):
         runpy.run_path(str(SCRIPT_PATH), run_name="__main__")
+
+
+def run_fake_cli_child(
+    *args: str,
+    scenario: str = "success",
+    close_stdout: bool = False,
+    stdout: int = subprocess.PIPE,
+) -> subprocess.CompletedProcess[str]:
+    launch = (
+        "import sys; "
+        "from tests.ruleset.test_apply_ruleset import run_cli_with_fake_gh; "
+        "run_cli_with_fake_gh(sys.argv.pop(1))"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write_json(tmp, "ruleset.json", DECLARED)
+        command = [
+            sys.executable, "-E", "-B", "-c", launch, scenario, "--file", str(path),
+            *args,
+        ]
+        if close_stdout:
+            command = ["sh", "-c", 'exec "$@" 1>&-', "sh", *command]
+        return subprocess.run(
+            command, cwd=REPO_ROOT, stdout=stdout, stderr=subprocess.PIPE,
+            text=True, timeout=10, check=False,
+        )
 
 
 class LoadGhJsonTests(unittest.TestCase):
@@ -405,20 +444,27 @@ class ApplyRulesetTests(unittest.TestCase):
         gh.put.assert_called_once()
         self.assertEqual(captured.getvalue(), WRITING)
 
-    def test_finding_6_pointer_visible_at_put(self) -> None:
-        err = io.StringIO()
+    def test_finding_s9_4_pointer_flushed_before_put(self) -> None:
         gh = FakeGh(get_sequence=[LIVE, merged_live()])
 
-        def put(_: str) -> str:
-            self.assertEqual(err.getvalue(), WRITING)
-            return "{}"
+        with (
+            tempfile.TemporaryFile(buffering=0) as raw,
+            io.TextIOWrapper(
+                io.BufferedWriter(raw), encoding="utf-8", newline="\n"
+            ) as err,
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(err),
+        ):
+            def put(_: str) -> str:
+                raw.seek(0)
+                self.assertEqual(raw.read(), WRITING.encode())
+                return "{}"
 
-        gh.put.side_effect = put
-        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            gh.put.side_effect = put
             rc = apply_ruleset._write_and_verify(
                 gh, "VMAFx/.github", 7, LIVE, merged_live(), DECLARED
             )
-        self.assertEqual(rc, 0, msg=err.getvalue())
+        self.assertEqual(rc, 0)
         gh.put.assert_called_once()
 
     def test_finding_6_initial_history_runtime_error_propagates(self) -> None:
@@ -544,6 +590,56 @@ class ApplyRulesetTests(unittest.TestCase):
             WRITING + "could not write read-back result to stdout\n"
             "ruleset history shows 1 new version (4101)\n" + HISTORY_POINTER,
         )
+
+    def test_finding_s9_1_broken_stderr_after_pointer(self) -> None:
+        result = run_fake_cli_child("--apply", scenario="broken stderr")
+        self.assertEqual(result.returncode, 1, msg=result.stderr)
+        self.assertEqual(result.stderr, WRITING)
+
+    @unittest.skipUnless(os.name == "posix", "closing stdout at launch requires sh")
+    def test_finding_s9_2_absent_stdout_success(self) -> None:
+        applied = run_fake_cli_child("--apply", close_stdout=True)
+        self.assertEqual(applied.returncode, 1, msg=applied.stderr)
+        self.assertEqual(
+            applied.stderr,
+            WRITING + "could not write read-back result to stdout\n"
+            "ruleset history shows 1 new version (4101)\n" + HISTORY_POINTER,
+        )
+        # The dry run returns zero from main, so stream settlement decides its status.
+        dry_run = run_fake_cli_child(close_stdout=True)
+        self.assertEqual(dry_run.returncode, 1, msg=dry_run.stderr)
+        self.assertEqual(dry_run.stderr, "")
+
+    @unittest.skipUnless(os.name == "posix", "closing stdout at launch requires sh")
+    def test_finding_s9_2_absent_stdout_traceback(self) -> None:
+        result = run_fake_cli_child(close_stdout=True, scenario="unexpected error")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Traceback (most recent call last):", result.stderr)
+        self.assertEqual(
+            result.stderr.splitlines()[-1], "RuntimeError: unexpected ruleset failure"
+        )
+
+    def test_finding_s9_2_help_closed_pipe(self) -> None:
+        reader, writer = os.pipe()
+        os.close(reader)
+        with os.fdopen(writer, "wb") as pipe:
+            result = run_fake_cli_child("--help", stdout=pipe.fileno())
+        self.assertEqual(result.returncode, 1, msg=result.stderr)
+
+    def test_finding_s9_2_argparse_status(self) -> None:
+        help_text = run_fake_cli_child("--help")
+        self.assertEqual(help_text.returncode, 0, msg=help_text.stderr)
+        self.assertIn("usage:", help_text.stdout)
+        unknown = run_fake_cli_child("--no-such-option")
+        self.assertEqual(unknown.returncode, 2)
+        self.assertIn("unrecognized arguments: --no-such-option", unknown.stderr)
+
+    def test_finding_s9_2_system_exit_codes(self) -> None:
+        for code, status in ((None, 0), (42, 42), ("message", 1)):
+            with self.subTest(code=code), patch.object(
+                apply_ruleset, "main", side_effect=SystemExit(code)
+            ):
+                self.assertEqual(apply_ruleset._cli([]), status)
 
     def test_finding_2_closed_stdout_reports_history(self) -> None:
         gh = FakeGh(get_sequence=[LIVE, merged_live()])
@@ -676,6 +772,20 @@ class ApplyRulesetTests(unittest.TestCase):
         self.assert_apply_failure(
             gh, "GET failed\nhistory unreadable: history failed", 1
         )
+
+    def test_finding_s9_5_rejects_oversized_page(self) -> None:
+        gh = FakeGh(history_sequence=[list(range(101)), []])
+        with self.assertRaisesRegex(
+            apply_ruleset.GhError, "^ruleset history page 1 exceeds 100 entries$"
+        ):
+            apply_ruleset.fetch_history_ids(gh, "VMAFx/.github", 7)
+        gh.history.assert_called_once_with(1)
+
+    def test_finding_s9_5_full_then_short_page(self) -> None:
+        gh = FakeGh(history_sequence=[list(range(100)), [100]])
+        ids = apply_ruleset.fetch_history_ids(gh, "VMAFx/.github", 7)
+        self.assertEqual(ids, set(range(101)))
+        self.assertEqual(gh.history.call_args_list, [call(1), call(2)])
 
     def test_reports_new_version_on_second_history_page(self) -> None:
         first_page = list(range(100))

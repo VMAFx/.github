@@ -55,7 +55,12 @@ pending=
 cleanup() {
   trap '' HUP INT TERM
   if [ -n "$scratch" ] && ! rm -r -- "$scratch"; then
-    printf 'check-claims: could not remove scratch directory: %s\n' "$scratch" >&2
+    if ! (
+      printf 'check-claims: could not remove scratch directory: %s\n' "$scratch" >&2
+    ); then
+      # A closed or broken stderr leaves nowhere else to report the failure.
+      exit "$1"
+    fi
   fi
   exit "$1"
 }
