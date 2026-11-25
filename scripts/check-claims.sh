@@ -52,7 +52,14 @@ case "$resolved/" in
 esac
 scratch=
 pending=
-trap '[ -n "$scratch" ] && rm -r -- "$scratch"' EXIT
+cleanup() {
+  trap '' HUP INT TERM
+  if [ -n "$scratch" ] && ! rm -r -- "$scratch"; then
+    printf 'check-claims: could not remove scratch directory: %s\n' "$scratch" >&2
+  fi
+  exit "$1"
+}
+trap 'cleanup "${pending:-$?}"' EXIT
 trap 'pending=129' HUP
 trap 'pending=130' INT
 trap 'pending=143' TERM

@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 TOP_LEVEL_KEYS = ("name", "target", "enforcement", "conditions", "bypass_actors")
 HISTORY_PAGE = 100
@@ -389,6 +390,16 @@ def _describe(exc: BaseException) -> str:
             return name
 
 
+def _emit(stream: TextIO, text: str) -> bool:
+    try:
+        line = text + "\n"
+        written = stream.write(line)
+        stream.flush()
+        return written == len(line)
+    except Exception:  # noqa: BLE001 - the pre-PUT pointer survives a failed report
+        return False
+
+
 def _history_report(
     gh: Callable[..., str],
     repo: str,
@@ -411,8 +422,13 @@ def _history_report(
         ids = ", ".join(map(str, new))
         return single, f"ruleset history shows {len(new)} new {versions} ({ids})"
     except reportable as exc:
-        if isinstance(exc, GhError) and not isinstance(exc.__cause__, GH_JSON_ERRORS):
-            return False, f"history unreadable: {_describe(exc)}"
+        if issubclass(type(exc), GhError):
+            try:
+                cause = BaseException.__dict__["__cause__"].__get__(exc)
+            except Exception:  # noqa: BLE001 - preserve the history diagnostic
+                cause = None
+            if not issubclass(type(cause), GH_JSON_ERRORS):
+                return False, f"history unreadable: {_describe(exc)}"
         return False, f"history unreadable ({_exception_name(exc)}): {_describe(exc)}"
 
 
@@ -435,18 +451,12 @@ def _verify_write(
 
     single, history = _history_report(gh, repo, ruleset_id, before, after_write=True)
     if single and not errors:
-        try:
-            print(
-                f"read-back: {len(declared['rules'])} declared rules match", flush=True
-            )
+        message = f"read-back: {len(declared['rules'])} declared rules match"
+        if _emit(sys.stdout, message):
             return 0
-        except OSError as exc:
-            errors = [_describe(exc)]
+        errors = ["could not write read-back result to stdout"]
     pointer = _history_pointer(repo, ruleset_id)
-    try:
-        print(*errors, history, pointer, sep="\n", file=sys.stderr)
-    except OSError:
-        pass  # The history pointer was printed before the PUT.
+    _emit(sys.stderr, "\n".join([*errors, history, pointer]))
     return 1
 
 
@@ -462,14 +472,14 @@ def _write_and_verify(
     try:
         before = fetch_history_ids(gh, repo, ruleset_id)
     except GhError as exc:
-        print(f"history unreadable: {exc}", pointer, sep="\n", file=sys.stderr)
+        print(f"history unreadable: {_describe(exc)}\n{pointer}", file=sys.stderr)
         return 1
 
     def report_failure(exc: Exception, *, after_write: bool) -> int:
         _, history = _history_report(
             gh, repo, ruleset_id, before, after_write=after_write
         )
-        print(_describe(exc), history, pointer, sep="\n", file=sys.stderr)
+        _emit(sys.stderr, f"{_describe(exc)}\n{history}\n{pointer}")
         return 1
 
     try:
@@ -545,9 +555,23 @@ def main(argv: list[str], gh: Callable[..., str] = run_gh) -> int:
             return 0
         return _write_and_verify(gh, repo, ruleset_id, live, desired, declared)
     except GhError as exc:
-        print(exc, file=sys.stderr)
+        _emit(sys.stderr, _describe(exc))
         return 1
 
 
+def _cli() -> int:
+    try:
+        status = main(sys.argv[1:])
+    finally:
+        try:
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            # CPython retries this flush at shutdown and can replace the exit status.
+            with open(os.devnull, "w") as sink:
+                os.dup2(sink.fileno(), 1)
+            status = 1
+    return status
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(_cli())

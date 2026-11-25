@@ -6,6 +6,8 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -174,6 +176,20 @@ def run_main(
     return rc, out.getvalue(), err.getvalue()
 
 
+def run_cli_with_fake_gh() -> None:
+    gh = FakeGh(get_sequence=[LIVE, LIVE, merged_live()])
+
+    def run(
+        cmd: list[str], *, input: bytes | None, **kwargs
+    ) -> subprocess.CompletedProcess:
+        payload = input.decode() if input is not None else None
+        reply = gh(cmd[1:], payload)
+        return subprocess.CompletedProcess(cmd, 0, reply.encode(), b"")
+
+    with patch.object(subprocess, "run", run):
+        runpy.run_path(str(SCRIPT_PATH), run_name="__main__")
+
+
 class LoadGhJsonTests(unittest.TestCase):
     def test_parser_failures_keep_cause(self) -> None:
         self.addCleanup(sys.set_int_max_str_digits, sys.get_int_max_str_digits())
@@ -325,6 +341,94 @@ class ApplyRulesetTests(unittest.TestCase):
         )
         self.assert_apply_failure(gh, "history unreadable (RuntimeError): lost page", 1)
 
+    def test_finding_3_history_uses_actual_cause_and_type(self) -> None:
+        class HistoryFailure(apply_ruleset.GhError):
+            @property
+            def __cause__(self):
+                raise ValueError("cannot read cause")
+
+        class TransportFailure(Exception):
+            @property
+            def __class__(self):
+                raise ValueError("cannot read class")
+
+        for cause, label in (
+            (ValueError(), "history unreadable (HistoryFailure)"),
+            (TransportFailure(), "history unreadable"),
+        ):
+            with self.subTest(label=label):
+                error = HistoryFailure("lost page")
+                BaseException.__dict__["__cause__"].__set__(error, cause)
+                gh = FakeGh(
+                    get_sequence=[LIVE, LIVE, merged_live()],
+                    history_sequence=[[97], error],
+                )
+                # unittest also follows __cause__ when rendering an escaped error.
+                try:
+                    self.assert_apply_failure(gh, f"{label}: lost page", 1)
+                except ValueError as exc:
+                    escaped = str(exc)
+                else:
+                    escaped = None
+                self.assertIsNone(escaped)
+
+    def test_finding_4_unprintable_gh_error_before_write(self) -> None:
+        class LostReply(apply_ruleset.GhError):
+            def __str__(self) -> str:
+                raise ValueError("cannot format")
+
+        detail = "LostReply (message unavailable: ValueError)"
+        gh = FakeGh(history_sequence=[LostReply()])
+        self.assert_apply_failure(gh, f"history unreadable: {detail}", 0)
+        gh = FakeGh(fail=LostReply())
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_json(tmp, "ruleset.json", DECLARED)
+            rc, _, err = run_main(["--file", str(path), "--apply"], gh)
+        self.assertEqual((rc, err), (1, detail + "\n"))
+        gh.put.assert_not_called()
+
+    def test_finding_5_failed_put_with_closed_stderr(self) -> None:
+        captured = io.StringIO()
+        err = Mock(wraps=captured)
+        gh = FakeGh()
+
+        def fail_put(_: str) -> None:
+            err.write.side_effect = BrokenPipeError("stderr closed")
+            raise RuntimeError("lost PUT reply")
+
+        gh.put.side_effect = fail_put
+        with redirect_stderr(err):
+            rc = apply_ruleset._write_and_verify(
+                gh, "VMAFx/.github", 7, LIVE, merged_live(), DECLARED
+            )
+        self.assertEqual(rc, 1)
+        gh.put.assert_called_once()
+        self.assertEqual(captured.getvalue(), WRITING)
+
+    def test_finding_6_pointer_visible_at_put(self) -> None:
+        err = io.StringIO()
+        gh = FakeGh(get_sequence=[LIVE, merged_live()])
+
+        def put(_: str) -> str:
+            self.assertEqual(err.getvalue(), WRITING)
+            return "{}"
+
+        gh.put.side_effect = put
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = apply_ruleset._write_and_verify(
+                gh, "VMAFx/.github", 7, LIVE, merged_live(), DECLARED
+            )
+        self.assertEqual(rc, 0, msg=err.getvalue())
+        gh.put.assert_called_once()
+
+    def test_finding_6_initial_history_runtime_error_propagates(self) -> None:
+        gh = FakeGh(history_sequence=[RuntimeError("lost initial page")])
+        with self.assertRaisesRegex(RuntimeError, "^lost initial page$"):
+            apply_ruleset._write_and_verify(
+                gh, "VMAFx/.github", 7, LIVE, merged_live(), DECLARED
+            )
+        gh.put.assert_not_called()
+
     def test_unexpected_put_error_reports_history(self) -> None:
         gh = FakeGh(get_sequence=[LIVE, LIVE])
         gh.put.side_effect = RuntimeError("lost PUT reply")
@@ -412,6 +516,52 @@ class ApplyRulesetTests(unittest.TestCase):
         gh.put.assert_not_called()
         self.assertEqual(err.getvalue(), "")
 
+    def test_finding_2_cli_closed_pipe_returns_failure(self) -> None:
+        launch = (
+            "from tests.ruleset.test_apply_ruleset import run_cli_with_fake_gh; "
+            "run_cli_with_fake_gh()"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_json(tmp, "ruleset.json", DECLARED)
+            reader, writer = os.pipe()
+            os.close(reader)
+            with os.fdopen(writer, "wb") as pipe:
+                result = subprocess.run(
+                    [
+                        sys.executable, "-E", "-B", "-c", launch, "--apply",
+                        "--repo", "VMAFx/.github", "--file", str(path),
+                    ],
+                    cwd=REPO_ROOT,
+                    stdout=pipe,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+        self.assertEqual(result.returncode, 1, msg=result.stderr)
+        self.assertEqual(
+            result.stderr,
+            WRITING + "could not write read-back result to stdout\n"
+            "ruleset history shows 1 new version (4101)\n" + HISTORY_POINTER,
+        )
+
+    def test_finding_2_closed_stdout_reports_history(self) -> None:
+        gh = FakeGh(get_sequence=[LIVE, merged_live()])
+        out = io.StringIO()
+        out.close()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = apply_ruleset._write_and_verify(
+                gh, "VMAFx/.github", 7, LIVE, merged_live(), DECLARED
+            )
+        self.assertEqual(rc, 1)
+        gh.put.assert_called_once()
+        self.assertEqual(
+            err.getvalue(),
+            WRITING + "could not write read-back result to stdout\n"
+            "ruleset history shows 1 new version (4101)\n" + HISTORY_POINTER,
+        )
+
     def test_broken_success_output_reports_history(self) -> None:
         gh = FakeGh(get_sequence=[LIVE, merged_live()])
         out = Mock()
@@ -425,13 +575,14 @@ class ApplyRulesetTests(unittest.TestCase):
         gh.put.assert_called_once()
         self.assertEqual(
             err.getvalue(),
-            WRITING + "pipe closed\nruleset history shows 1 new version (4101)\n"
-            + HISTORY_POINTER,
+            WRITING + "could not write read-back result to stdout\n"
+            "ruleset history shows 1 new version (4101)\n" + HISTORY_POINTER,
         )
 
     def test_broken_success_output_and_stderr_return_failure(self) -> None:
         gh = FakeGh(get_sequence=[LIVE, merged_live()])
-        err = Mock(wraps=io.StringIO())
+        captured = io.StringIO()
+        err = Mock(wraps=captured)
 
         def close_outputs(_: str) -> None:
             err.write.side_effect = BrokenPipeError("stderr closed")
@@ -445,6 +596,7 @@ class ApplyRulesetTests(unittest.TestCase):
             )
         self.assertEqual(rc, 1)
         gh.put.assert_called_once()
+        self.assertEqual(captured.getvalue(), WRITING)
 
     def test_foreign_write_before_put_stops(self) -> None:
         gh = FakeGh(
