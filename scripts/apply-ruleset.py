@@ -18,6 +18,7 @@ from typing import Any
 
 TOP_LEVEL_KEYS = ("name", "target", "enforcement", "conditions", "bypass_actors")
 HISTORY_PAGE = 100
+MAX_HISTORY_PAGES = 10
 
 
 class GhError(Exception):
@@ -59,10 +60,13 @@ def validate_declared(data: Any) -> list[str]:
     for key in (*TOP_LEVEL_KEYS, "rules"):
         if key not in data:
             errors.append(f"ruleset file missing required key: {key}")
-    rules = data.get("rules")
+    return errors + _rule_shape_errors(data.get("rules"))
+
+
+def _rule_shape_errors(rules: Any) -> list[str]:
     if not isinstance(rules, list):
-        errors.append("rules must be a list")
-        return errors
+        return ["rules must be a list"]
+    errors: list[str] = []
     for index, rule in enumerate(rules):
         if not isinstance(rule, dict):
             errors.append(f"rules[{index}] must be an object")
@@ -95,27 +99,40 @@ def list_rulesets(gh: Callable[..., str], repo: str) -> list[dict[str, Any]]:
     return data
 
 
-def fetch_ruleset(gh: Callable[..., str], repo: str, ruleset_id: int) -> dict[str, Any]:
+def fetch_ruleset(
+    gh: Callable[..., str], repo: str, ruleset_id: int, *, readback: bool = False
+) -> dict[str, Any]:
     raw = gh(["api", f"repos/{repo}/rulesets/{ruleset_id}"])
     data = json.loads(raw)
     if not isinstance(data, dict):
+        if readback:
+            raise GhError("malformed ruleset read-back: expected an object")
         raise GhError(f"unexpected ruleset payload type: {type(data).__name__}")
+    if readback:
+        errors = _rule_shape_errors(data.get("rules"))
+        if errors:
+            raise GhError(f"malformed ruleset read-back: {errors[0]}")
     return data
 
 
 def fetch_history_ids(gh: Callable[..., str], repo: str, ruleset_id: int) -> set[int]:
-    """Return the version ids on the first page of the ruleset history."""
+    """Read complete history or fail when the page limit prevents verification."""
     path = f"repos/{repo}/rulesets/{ruleset_id}/history?per_page={HISTORY_PAGE}"
-    data = json.loads(gh(["api", path]))
-    if not isinstance(data, list):
-        raise GhError(f"unexpected ruleset history payload type: {type(data).__name__}")
     ids: set[int] = set()
-    for entry in data:
-        version = entry.get("version_id") if isinstance(entry, dict) else None
-        if not isinstance(version, int) or isinstance(version, bool):
-            raise GhError("ruleset history entry without an integer version_id")
-        ids.add(version)
-    return ids
+    for page in range(1, MAX_HISTORY_PAGES + 1):
+        data = json.loads(gh(["api", f"{path}&page={page}"]))
+        if not isinstance(data, list):
+            raise GhError(
+                f"unexpected ruleset history payload type: {type(data).__name__}"
+            )
+        for entry in data:
+            version = entry.get("version_id") if isinstance(entry, dict) else None
+            if not isinstance(version, int) or isinstance(version, bool):
+                raise GhError("ruleset history entry without an integer version_id")
+            ids.add(version)
+        if len(data) < HISTORY_PAGE:
+            return ids
+    raise GhError(f"history longer than {MAX_HISTORY_PAGES} pages")
 
 
 def _history_pointer(repo: str, ruleset_id: int) -> str:
@@ -346,6 +363,22 @@ def _locate_ruleset(gh: Callable[..., str], repo: str, name: str) -> int | None:
     return None
 
 
+def _history_report(
+    gh: Callable[..., str], repo: str, ruleset_id: int, before: set[int]
+) -> tuple[bool, str]:
+    """Return whether exactly one version appeared and the diagnostic line."""
+    try:
+        new = sorted(fetch_history_ids(gh, repo, ruleset_id) - before)
+    except (GhError, json.JSONDecodeError) as exc:
+        return False, f"history unreadable: {exc}"
+    if not new:
+        return False, "ruleset history shows no new version after the write"
+    single = len(new) == 1
+    versions = "version" if single else "versions"
+    ids = ", ".join(map(str, new))
+    return single, f"ruleset history shows {len(new)} new {versions} ({ids})"
+
+
 def _verify_write(
     gh: Callable[..., str],
     repo: str,
@@ -355,28 +388,17 @@ def _verify_write(
     before: set[int],
 ) -> int:
     try:
-        readback = fetch_ruleset(gh, repo, ruleset_id)
+        readback = fetch_ruleset(gh, repo, ruleset_id, readback=True)
         errors = readback_errors(readback, declared, live)
     except (GhError, json.JSONDecodeError) as exc:
         errors = [str(exc)]
 
-    try:
-        after = fetch_history_ids(gh, repo, ruleset_id)
-    except (GhError, json.JSONDecodeError) as exc:
-        errors.append(f"history unreadable: {exc}")
-    else:
-        new = sorted(after - before)
-        if len(new) == 1 and not errors:
-            print(f"read-back: {len(declared['rules'])} declared rules match")
-            return 0
-        if new:
-            versions = "version" if len(new) == 1 else "versions"
-            ids = ", ".join(map(str, new))
-            errors.append(f"ruleset history shows {len(new)} new {versions} ({ids})")
-        else:
-            errors.append("ruleset history shows no new version after the write")
-
-    print(*errors, _history_pointer(repo, ruleset_id), sep="\n", file=sys.stderr)
+    single, history = _history_report(gh, repo, ruleset_id, before)
+    if single and not errors:
+        print(f"read-back: {len(declared['rules'])} declared rules match")
+        return 0
+    pointer = _history_pointer(repo, ruleset_id)
+    print(*errors, history, pointer, sep="\n", file=sys.stderr)
     return 1
 
 
@@ -404,7 +426,8 @@ def _write_and_verify(
             )
         _put_ruleset(gh, repo, ruleset_id, desired)
     except (GhError, json.JSONDecodeError) as exc:
-        print(exc, pointer, sep="\n", file=sys.stderr)
+        _, history = _history_report(gh, repo, ruleset_id, before)
+        print(exc, history, pointer, sep="\n", file=sys.stderr)
         return 1
     return _verify_write(gh, repo, ruleset_id, live, declared, before)
 

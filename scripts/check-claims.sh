@@ -33,6 +33,18 @@ fi
 
 scratch=$(mktemp -d)
 trap 'rm -r "$scratch"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+checkout=$(pwd -P)
+scratch_path=$(CDPATH='' cd -P "$scratch" && pwd -P)
+scratch=$scratch_path
+case "$scratch/" in
+  "${checkout%/}/"*)
+    printf 'check-claims: scratch directory inside the checkout: %s\n' "$scratch" >&2
+    exit 1
+    ;;
+esac
 cp -R .vale.ini .vale "$scratch/"
 mkdir "$scratch/profile"
 readme="$scratch/profile/README.md"

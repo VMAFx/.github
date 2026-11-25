@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "apply-ruleset.py"
@@ -94,6 +94,11 @@ HISTORY_POINTER = (
     "inspect each version with gh api repos/VMAFx/.github/rulesets/7/history/"
     "<version_id>, restore the intended state, then re-run\n"
 )
+SNAPSHOT_REFUSAL = (
+    "live ruleset praetor-main-protection (7) changed since it was read; "
+    "nothing written; re-run to merge against the current state\n"
+    "ruleset history shows 1 new version (4101)"
+)
 
 
 class FakeGh:
@@ -101,7 +106,7 @@ class FakeGh:
         self,
         *,
         list_payload: list[dict] | None = None,
-        get_sequence: list[dict | Exception] | None = None,
+        get_sequence: list[dict | list | Exception] | None = None,
         fail: Exception | None = None,
         bad_json: bool = False,
         history_sequence: list[list[int] | Exception] | None = None,
@@ -135,8 +140,10 @@ class FakeGh:
         path = args[1]
         if path.startswith("repos/") and "/rulesets?" in path:
             return "not json" if self.bad_json else json.dumps(self.list_payload)
-        if path == "repos/VMAFx/.github/rulesets/7/history?per_page=100":
-            return json.dumps([{"version_id": version} for version in self.history()])
+        endpoint, _, page = path.partition("&page=")
+        if endpoint == "repos/VMAFx/.github/rulesets/7/history?per_page=100":
+            versions = self.history(int(page))
+            return json.dumps([{"version_id": version} for version in versions])
         if path == "repos/VMAFx/.github/rulesets/7":
             return json.dumps(self.get())
         raise AssertionError(f"unexpected gh call: {args!r}, stdin=None")
@@ -164,11 +171,12 @@ class ApplyRulesetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = write_json(tmp, "ruleset.json", DECLARED)
             gh = FakeGh()
-            rc, out, _ = run_main(
+            rc, out, err = run_main(
                 ["--repo", "VMAFx/.github", "--file", str(path)],
                 gh,
             )
             self.assertEqual(rc, 0)
+            self.assertEqual(err, "")
             self.assertIn("copilot_code_review", out)
             puts = [call for call in gh.calls if call[0][:3] == ["api", "-X", "PUT"]]
             self.assertEqual(puts, [])
@@ -183,6 +191,7 @@ class ApplyRulesetTests(unittest.TestCase):
                 gh,
             )
             self.assertEqual(rc, 0, msg=err)
+            self.assertEqual(err, "")
             puts = [call for call in gh.calls if call[0][:3] == ["api", "-X", "PUT"]]
             self.assertEqual(len(puts), 1)
             payload = json.loads(puts[0][1] or "{}")
@@ -205,6 +214,8 @@ class ApplyRulesetTests(unittest.TestCase):
                 gh,
             )
             self.assertEqual(rc, 0, msg=err)
+            self.assertEqual(err, "")
+            self.assertEqual(gh.put.call_count, 1)
             history_calls = [
                 i
                 for i, (args, _) in enumerate(gh.calls)
@@ -270,13 +281,85 @@ class ApplyRulesetTests(unittest.TestCase):
 
     def test_failed_fresh_get_writes_nothing(self) -> None:
         gh = FakeGh(get_sequence=[LIVE, apply_ruleset.GhError("fresh GET failed")])
-        self.assert_apply_failure(gh, "fresh GET failed", 0)
-        gh.history.assert_called_once()
+        self.assert_apply_failure(
+            gh, "fresh GET failed\nruleset history shows 1 new version (4101)", 0
+        )
 
     def test_failed_put_reports_history_endpoint(self) -> None:
-        gh = FakeGh(get_sequence=[LIVE, LIVE])
+        gh = FakeGh(get_sequence=[LIVE, LIVE], history_sequence=[[4101], [4101]])
         gh.put.side_effect = apply_ruleset.GhError("PUT failed")
-        self.assert_apply_failure(gh, "PUT failed", 1)
+        self.assert_apply_failure(
+            gh, "PUT failed\nruleset history shows no new version after the write", 1
+        )
+
+    def test_put_timeout_reports_new_version(self) -> None:
+        gh = FakeGh(get_sequence=[LIVE, LIVE], history_sequence=[[4101], [7303, 4101]])
+        gh.put.side_effect = apply_ruleset.GhError("PUT timed out")
+        self.assert_apply_failure(
+            gh, "PUT timed out\nruleset history shows 1 new version (7303)", 1
+        )
+
+    def test_malformed_readback_reports_new_version(self) -> None:
+        cases = (
+            ({"rules": None}, "rules must be a list"),
+            ({}, "rules must be a list"),
+            ({"rules": [None]}, "rules[0] must be an object"),
+            ({"rules": [{"type": 1}]}, "rules[0] must have a string type"),
+            ([], "expected an object"),
+        )
+        for readback, detail in cases:
+            with self.subTest(readback=readback):
+                gh = FakeGh(
+                    get_sequence=[LIVE, LIVE, readback],
+                    history_sequence=[[4101], [7303, 4101]],
+                )
+                self.assert_apply_failure(
+                    gh,
+                    f"malformed ruleset read-back: {detail}\n"
+                    "ruleset history shows 1 new version (7303)",
+                    1,
+                )
+
+    def test_failed_readback_and_history_report_both_errors(self) -> None:
+        gh = FakeGh(
+            get_sequence=[LIVE, LIVE, apply_ruleset.GhError("GET failed")],
+            history_sequence=[[4101], apply_ruleset.GhError("history failed")],
+        )
+        self.assert_apply_failure(
+            gh, "GET failed\nhistory unreadable: history failed", 1
+        )
+
+    def test_reports_new_version_on_second_history_page(self) -> None:
+        first_page = list(range(100))
+        gh = FakeGh(
+            get_sequence=[LIVE, LIVE, apply_ruleset.GhError("GET failed")],
+            history_sequence=[
+                first_page, [101, 102, 4101], first_page, [102, 4101, 7303]
+            ],
+        )
+        self.assert_apply_failure(
+            gh, "GET failed\nruleset history shows 1 new version (7303)", 1
+        )
+        self.assertEqual(
+            gh.history.call_args_list, [call(1), call(2), call(1), call(2)]
+        )
+
+    def test_full_tenth_history_page_is_unreadable(self) -> None:
+        full_pages = [list(range(start, start + 100)) for start in range(0, 1000, 100)]
+        reason = "history unreadable: history longer than 10 pages"
+        for put_count in (0, 1):
+            with self.subTest(put_count=put_count):
+                before = [[4101]] if put_count else []
+                gh = FakeGh(
+                    get_sequence=[LIVE, LIVE, merged_live()],
+                    history_sequence=before + full_pages,
+                )
+                self.assert_apply_failure(gh, reason, put_count)
+                initial_calls = [call(1)] if put_count else []
+                self.assertEqual(
+                    gh.history.call_args_list,
+                    initial_calls + [call(page) for page in range(1, 11)],
+                )
 
     def test_failed_readback_reports_new_version(self) -> None:
         gh = FakeGh(get_sequence=[LIVE, LIVE, apply_ruleset.GhError("GET failed")])
@@ -303,11 +386,12 @@ class ApplyRulesetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = write_json(tmp, "ruleset.json", DECLARED)
             gh = FakeGh()
-            rc, _, _ = run_main(
+            rc, _, err = run_main(
                 ["--repo", "VMAFx/.github", "--file", str(path)],
                 gh,
             )
             self.assertEqual(rc, 0)
+            self.assertEqual(err, "")
             history_calls = [call for call in gh.calls if "/history" in call[0][1]]
             self.assertEqual(history_calls, [])
 
@@ -323,7 +407,9 @@ class ApplyRulesetTests(unittest.TestCase):
                 gh,
             )
             self.assertEqual(rc, 0, msg=err)
+            self.assertEqual(err, "")
             puts = [call for call in gh.calls if call[0][:3] == ["api", "-X", "PUT"]]
+            self.assertEqual(len(puts), 1)
             payload = json.loads(puts[0][1] or "{}")
             types = {rule["type"] for rule in payload["rules"]}
             self.assertIn("creation", types)
@@ -334,11 +420,12 @@ class ApplyRulesetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = write_json(tmp, "ruleset.json", DECLARED)
             gh = FakeGh(get_sequence=[merged])
-            rc, out, _ = run_main(
+            rc, out, err = run_main(
                 ["--repo", "VMAFx/.github", "--file", str(path)],
                 gh,
             )
             self.assertEqual(rc, 0)
+            self.assertEqual(err, "")
             self.assertIn("already matches", out)
             puts = [call for call in gh.calls if call[0][:3] == ["api", "-X", "PUT"]]
             self.assertEqual(puts, [])
@@ -413,49 +500,28 @@ class ApplyRulesetTests(unittest.TestCase):
             r for r in snapshot["rules"] if r["type"] != "required_signatures"
         ]
         re_read = json.loads(json.dumps(LIVE))
-        with tempfile.TemporaryDirectory() as tmp:
-            path = write_json(tmp, "ruleset.json", DECLARED)
-            gh = FakeGh(get_sequence=[snapshot, re_read])
-            rc, _, err = run_main(
-                ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
-                gh,
-            )
-            self.assertEqual(rc, 1)
-            self.assertIn("changed since it was read", err)
-            puts = [call for call in gh.calls if call[0][:3] == ["api", "-X", "PUT"]]
-            self.assertEqual(puts, [])
+        gh = FakeGh(get_sequence=[snapshot, re_read])
+        self.assert_apply_failure(gh, SNAPSHOT_REFUSAL, 0)
 
     def test_live_change_in_top_level_field_writes_nothing(self) -> None:
         re_read = json.loads(json.dumps(LIVE))
         re_read["bypass_actors"] = []
-        with tempfile.TemporaryDirectory() as tmp:
-            path = write_json(tmp, "ruleset.json", DECLARED)
-            gh = FakeGh(get_sequence=[LIVE, re_read])
-            rc, _, err = run_main(
-                ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
-                gh,
-            )
-            self.assertEqual(rc, 1)
-            self.assertIn("changed since it was read", err)
-            puts = [call for call in gh.calls if call[0][:3] == ["api", "-X", "PUT"]]
-            self.assertEqual(puts, [])
+        gh = FakeGh(get_sequence=[LIVE, re_read])
+        self.assert_apply_failure(gh, SNAPSHOT_REFUSAL, 0)
 
     def test_readback_missing_live_only_rule_fails(self) -> None:
         live = json.loads(json.dumps(LIVE))
         live["rules"].append({"type": "creation"})
         readback = json.loads(json.dumps(live))
         readback["rules"] = [r for r in readback["rules"] if r["type"] != "creation"]
-        with tempfile.TemporaryDirectory() as tmp:
-            path = write_json(tmp, "ruleset.json", DECLARED)
-            gh = FakeGh(get_sequence=[live, live, readback])
-            rc, _, err = run_main(
-                ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
-                gh,
-            )
-            self.assertEqual(rc, 1)
-            self.assertIn(
-                "live-only rule from the snapshot missing after read-back", err
-            )
+        gh = FakeGh(get_sequence=[live, live, readback])
+        self.assert_apply_failure(
+            gh,
+            "rule copilot_code_review: missing after read-back\n"
+            "rule creation: live-only rule from the snapshot missing after read-back\n"
+            "ruleset history shows 1 new version (4101)",
+            1,
+        )
 
     def test_readback_changed_live_only_parameters_fails(self) -> None:
         live = json.loads(json.dumps(LIVE))
@@ -468,15 +534,14 @@ class ApplyRulesetTests(unittest.TestCase):
         readback = json.loads(json.dumps(live))
         creation = next(r for r in readback["rules"] if r["type"] == "creation")
         creation["parameters"] = {"enabled": False}
-        with tempfile.TemporaryDirectory() as tmp:
-            path = write_json(tmp, "ruleset.json", DECLARED)
-            gh = FakeGh(get_sequence=[live, live, readback])
-            rc, _, err = run_main(
-                ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
-                gh,
-            )
-            self.assertEqual(rc, 1)
-            self.assertIn("live-only parameters changed after read-back", err)
+        gh = FakeGh(get_sequence=[live, live, readback])
+        self.assert_apply_failure(
+            gh,
+            "rule copilot_code_review: missing after read-back\n"
+            "rule creation: live-only parameters changed after read-back\n"
+            "ruleset history shows 1 new version (4101)",
+            1,
+        )
 
     def test_readback_lost_live_only_parameter_on_declared_rule_fails(self) -> None:
         readback = merged_live()
@@ -484,19 +549,14 @@ class ApplyRulesetTests(unittest.TestCase):
         del pull_request["parameters"][
             "require_extra_approval_for_unattributed_changes"
         ]
-        with tempfile.TemporaryDirectory() as tmp:
-            path = write_json(tmp, "ruleset.json", DECLARED)
-            gh = FakeGh(get_sequence=[LIVE, LIVE, readback])
-            rc, _, err = run_main(
-                ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
-                gh,
-            )
-            self.assertEqual(rc, 1)
-            self.assertIn(
-                "rule pull_request: live-only parameter "
-                "require_extra_approval_for_unattributed_changes changed after read-back",
-                err,
-            )
+        gh = FakeGh(get_sequence=[LIVE, LIVE, readback])
+        self.assert_apply_failure(
+            gh,
+            "rule pull_request: live-only parameter "
+            "require_extra_approval_for_unattributed_changes changed after read-back\n"
+            "ruleset history shows 1 new version (4101)",
+            1,
+        )
 
     def test_server_metadata_change_still_writes(self) -> None:
         re_read = {**LIVE, "id": 99, "updated_at": "2026-01-01T00:00:00Z"}
@@ -509,6 +569,7 @@ class ApplyRulesetTests(unittest.TestCase):
                 gh,
             )
             self.assertEqual(rc, 0, msg=err)
+            self.assertEqual(err, "")
             puts = [call for call in gh.calls if call[0][:3] == ["api", "-X", "PUT"]]
             self.assertEqual(len(puts), 1)
             self.assertIn("declared rules match", out)

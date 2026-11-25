@@ -33,10 +33,13 @@ matches the declared fields and rules, including the live-only rules and
 parameters from the original snapshot. A single new ID does not identify its
 author.
 
-If verification fails, the script exits with status 1 and reports the reason
-and the new version IDs in ascending order, or the history error. Inspect the
-versions with the following command, restore the intended state from the
-ruleset history, then re-run the apply.
+Every status 1 exit after the initial history read reports the failure, then
+lists all new version IDs in ascending order, reports that none appeared, or
+gives the history error. This includes a failed `PUT`, since GitHub may have
+recorded the update before the client timed out. Each history read stops at
+10 pages of 100 entries. A full tenth page makes the history unreadable.
+Inspect each reported version with the following command, restore the
+intended state from the ruleset history, then re-run the apply.
 
 ```bash
 gh api repos/{owner}/{repo}/rulesets/{ruleset_id}/history/{version_id}
