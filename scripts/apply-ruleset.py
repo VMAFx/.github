@@ -18,24 +18,26 @@ from typing import Any
 
 TOP_LEVEL_KEYS = ("name", "target", "enforcement", "conditions", "bypass_actors")
 HISTORY_PAGE = 100
-MAX_WRITE_ROUNDS = 2
 
 
 class GhError(Exception):
-    """``gh`` exited non-zero."""
+    """A GitHub CLI request failed."""
 
 
 def run_gh(args: list[str], stdin: str | None = None) -> str:
     """Run ``gh`` with a bounded wait and return stdout."""
     cmd = ["gh", *args]
-    result = subprocess.run(
-        cmd,
-        input=stdin,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise GhError(f"command: {cmd!r}\n{exc}") from exc
     if result.returncode != 0:
         raise GhError(f"command: {cmd!r}\nstderr: {result.stderr.strip()}")
     return result.stdout
@@ -122,73 +124,6 @@ def _history_pointer(repo: str, ruleset_id: int) -> str:
         f"repos/{repo}/rulesets/{ruleset_id}/history/<version_id>, restore the "
         "intended state, then re-run"
     )
-
-
-def concurrent_write_errors(
-    repo: str, ruleset_id: int, before: set[int], after: set[int]
-) -> list[str]:
-    """Return errors unless the write added exactly one history version."""
-    new = sorted(after - before)
-    if len(new) == 1:
-        return []
-    if new:
-        found = ", ".join(str(version) for version in new)
-        reason = (
-            f"ruleset history shows {len(new)} new versions ({found}) where this "
-            "write adds one: another client changed the ruleset during the apply"
-        )
-    else:
-        reason = "ruleset history shows no new version after the write"
-    return [f"{reason}; {_history_pointer(repo, ruleset_id)}"]
-
-
-def fetch_version_state(
-    gh: Callable[..., str], repo: str, ruleset_id: int, version_id: int
-) -> dict[str, Any]:
-    raw = gh(["api", f"repos/{repo}/rulesets/{ruleset_id}/history/{version_id}"])
-    data = json.loads(raw)
-    state = data.get("state") if isinstance(data, dict) else None
-    if not isinstance(state, dict):
-        raise GhError(f"ruleset history version {version_id} has no state object")
-    return state
-
-
-def _matches_payload(state: dict[str, Any], payload: dict[str, Any]) -> bool:
-    for key in TOP_LEVEL_KEYS:
-        if state.get(key) != payload.get(key):
-            return False
-    state_rules = state.get("rules", [])
-    payload_rules = payload.get("rules", [])
-    state_map = {t: _rule_params(r) for t, r in _rules_by_type(state_rules).items()}
-    payload_map = {t: _rule_params(r) for t, r in _rules_by_type(payload_rules).items()}
-    return state_map == payload_map
-
-
-def _other_version(
-    gh: Callable[..., str],
-    repo: str,
-    ruleset_id: int,
-    new_ids: list[int],
-    payload: dict[str, Any],
-) -> tuple[list[tuple[int, dict[str, Any]]], str]:
-    """Return versions to inspect and a reason if recovery cannot proceed."""
-    states = [
-        (version, fetch_version_state(gh, repo, ruleset_id, version))
-        for version in new_ids
-    ]
-    other = [
-        (version, state)
-        for version, state in states
-        if not _matches_payload(state, payload)
-    ]
-    matches = len(states) - len(other)
-    if matches == 0:
-        return states, "cannot find this write among the new ruleset versions"
-    if matches > 1:
-        return states, f"{matches} new ruleset versions match this write"
-    if len(other) > 1:
-        return other, f"{len(other)} new ruleset versions differ from this write"
-    return other, ""
 
 
 def find_ruleset_id(entries: list[dict[str, Any]], name: str) -> int | None:
@@ -411,60 +346,37 @@ def _locate_ruleset(gh: Callable[..., str], repo: str, name: str) -> int | None:
     return None
 
 
-def _finish_readback(
-    readback: dict[str, Any], declared: dict[str, Any], base: dict[str, Any]
-) -> int:
-    errors = readback_errors(readback, declared, base)
-    if errors:
-        for message in errors:
-            print(message, file=sys.stderr)
-        return 1
-    rule_count = len(declared.get("rules", []))
-    print(f"read-back: {rule_count} declared rules match")
-    return 0
-
-
-def _write_round(
+def _verify_write(
     gh: Callable[..., str],
     repo: str,
     ruleset_id: int,
+    live: dict[str, Any],
     declared: dict[str, Any],
-    base: dict[str, Any],
-    payload: dict[str, Any],
     before: set[int],
-    foreign_ids: list[int],
-) -> int | tuple[int, dict[str, Any], set[int]]:
-    """Return an exit code or the foreign version, its state and updated history."""
-    pointer = _history_pointer(repo, ruleset_id)
-    candidates: list[int] = []
+) -> int:
     try:
-        _put_ruleset(gh, repo, ruleset_id, payload)
         readback = fetch_ruleset(gh, repo, ruleset_id)
-        after = fetch_history_ids(gh, repo, ruleset_id)
-        new = sorted(after - before)
-        if not new:
-            (message,) = concurrent_write_errors(repo, ruleset_id, before, after)
-        elif len(new) == 1:
-            rc = _finish_readback(readback, declared, base)
-            if rc == 0 or not foreign_ids:
-                return rc
-            message = f"recovery read-back failed; {pointer}"
-        else:
-            candidates = new
-            versions, reason = _other_version(gh, repo, ruleset_id, new, payload)
-            if not reason:
-                version_id, state = versions[0]
-                return version_id, state, after
-            candidates = [version for version, _ in versions]
-            message = f"{reason}; {pointer}"
+        errors = readback_errors(readback, declared, live)
     except (GhError, json.JSONDecodeError) as exc:
-        message = f"{exc}; {pointer}"
+        errors = [str(exc)]
 
-    ids = [*foreign_ids, *candidates]
-    if ids:
-        found = ", ".join(str(version) for version in ids)
-        message = f"ruleset versions ({found}): {message}"
-    print(message, file=sys.stderr)
+    try:
+        after = fetch_history_ids(gh, repo, ruleset_id)
+    except (GhError, json.JSONDecodeError) as exc:
+        errors.append(f"history unreadable: {exc}")
+    else:
+        new = sorted(after - before)
+        if len(new) == 1 and not errors:
+            print(f"read-back: {len(declared['rules'])} declared rules match")
+            return 0
+        if new:
+            versions = "version" if len(new) == 1 else "versions"
+            ids = ", ".join(map(str, new))
+            errors.append(f"ruleset history shows {len(new)} new {versions} ({ids})")
+        else:
+            errors.append("ruleset history shows no new version after the write")
+
+    print(*errors, _history_pointer(repo, ruleset_id), sep="\n", file=sys.stderr)
     return 1
 
 
@@ -476,41 +388,25 @@ def _write_and_verify(
     desired: dict[str, Any],
     declared: dict[str, Any],
 ) -> int:
-    before = fetch_history_ids(gh, repo, ruleset_id)
-    fresh = fetch_ruleset(gh, repo, ruleset_id)
-    if _snapshot_view(fresh) != _snapshot_view(live):
-        print(
-            f"live ruleset {declared['name']} ({ruleset_id}) changed since it was read; "
-            "nothing written; re-run to merge against the current state",
-            file=sys.stderr,
-        )
+    pointer = _history_pointer(repo, ruleset_id)
+    try:
+        before = fetch_history_ids(gh, repo, ruleset_id)
+    except (GhError, json.JSONDecodeError) as exc:
+        print(f"history unreadable: {exc}", pointer, sep="\n", file=sys.stderr)
         return 1
-    base = live
-    payload = desired
-    foreign_ids: list[int] = []
-    for write_number in range(1, MAX_WRITE_ROUNDS + 1):
-        result = _write_round(
-            gh, repo, ruleset_id, declared, base, payload, before, foreign_ids
-        )
-        if isinstance(result, int):
-            return result
-        version_id, base, before = result
-        foreign_ids.append(version_id)
-        if write_number == MAX_WRITE_ROUNDS:
-            break
-        payload = merge_ruleset(base, declared)
-        print(
-            f"another client wrote ruleset version {version_id} during the apply; "
-            "merged its state with the declared file and writing again "
-            f"(write {write_number + 1} of {MAX_WRITE_ROUNDS})"
-        )
-    found = ", ".join(str(version) for version in foreign_ids)
-    print(
-        f"other clients wrote ruleset versions ({found}) during both writes; "
-        f"{_history_pointer(repo, ruleset_id)}",
-        file=sys.stderr,
-    )
-    return 1
+
+    try:
+        fresh = fetch_ruleset(gh, repo, ruleset_id)
+        if _snapshot_view(fresh) != _snapshot_view(live):
+            raise GhError(
+                f"live ruleset {declared['name']} ({ruleset_id}) changed since it was "
+                "read; nothing written; re-run to merge against the current state"
+            )
+        _put_ruleset(gh, repo, ruleset_id, desired)
+    except (GhError, json.JSONDecodeError) as exc:
+        print(exc, pointer, sep="\n", file=sys.stderr)
+        return 1
+    return _verify_write(gh, repo, ruleset_id, live, declared, before)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:

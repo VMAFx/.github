@@ -20,8 +20,10 @@ The CI lane covers one backend and one feature.
 with one rule, `VMAFx.AbsoluteClaim` (`.vale/styles/VMAFx/AbsoluteClaim.yml`),
 on `profile/*.md`. `scripts/check-claims.sh` lints the profile, requires
 `tests/claims/qualified.md` to pass, and requires one report for each of the
-eight expected phrases in `tests/claims/planted.md`. `lefthook.yml` lists the
-script as a commit-time command for changes to the profile, the style, the
+eight expected phrases in `tests/claims/planted.md`. A positive control plants a
+claim in a scratch copy of `profile/README.md` and requires a report on that
+line to verify the profile selector. `lefthook.yml` lists the script as a
+commit-time command for changes to the profile, the style, the
 fixtures, or the script. `.github/workflows/claims.yml` runs the same script
 inside the `jdkato/vale` image pinned by tag and digest, which Renovate updates.
 A phrase whose universal form is proven goes under the rule's `exceptions` with

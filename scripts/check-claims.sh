@@ -2,11 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@proton.me>
 # SPDX-License-Identifier: EUPL-1.2
 #
-# Claim check (docs/adr/0001-absolute-claim-check.md). The organisation profile
-# must carry no absolute claim, the qualified fixture must pass, and the
-# VMAFx.AbsoluteClaim rule must still report every planted claim. Exit 0 when
-# all three hold; exit 1 on a finding, a missing vale, a vale error, or a rule
-# that no longer reports the planted claims.
+# Claim check (docs/adr/0001-absolute-claim-check.md). Check the profile and
+# qualified fixture, then exercise both selectors with planted claims.
 set -eu
 
 for path in profile/README.md tests/claims/qualified.md tests/claims/planted.md; do
@@ -31,6 +28,25 @@ lint profile || rc=$?
 if [ "$rc" -ne 0 ]; then
   echo "check-claims: profile/ failed with rc $rc;" \
     "state the scope each claim's evidence proves (ADR-0001)" >&2
+  exit 1
+fi
+
+scratch=$(mktemp -d)
+trap 'rm -r "$scratch"' EXIT
+cp -R .vale.ini .vale "$scratch/"
+mkdir "$scratch/profile"
+readme="$scratch/profile/README.md"
+cp profile/README.md "$readme"
+printf '\n\nEvery device gives the same score.\n' >> "$readme"
+line=$(wc -l < "$readme")
+rc=0
+out=$(cd "$scratch" && lint profile) || rc=$?
+if [ "$rc" -ne 1 ] || ! printf '%s\n' "$out" | awk -F: -v line="$line" '
+  $1 == "profile/README.md" && $2 == line + 0 && $4 == "VMAFx.AbsoluteClaim" { hit = 1 }
+  END { exit !hit }
+'; then
+  printf '%s\n' "$out" >&2
+  echo "check-claims: profile selector does not reach profile/README.md" >&2
   exit 1
 fi
 
