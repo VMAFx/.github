@@ -477,7 +477,7 @@ def _write_and_verify(
     try:
         before = fetch_history_ids(gh, repo, ruleset_id)
     except GhError as exc:
-        print(f"history unreadable: {_describe(exc)}\n{pointer}", file=sys.stderr)
+        _emit(sys.stderr, f"history unreadable: {_describe(exc)}\n{pointer}")
         return 1
 
     def report_failure(exc: Exception, *, after_write: bool) -> int:
@@ -498,12 +498,12 @@ def _write_and_verify(
         return report_failure(exc, after_write=False)
 
     payload = json.dumps(desired)
-    print(
+    if not _emit(
+        sys.stderr,
         f"writing ruleset {declared['name']} ({ruleset_id}); "
         f"version history: {pointer}",
-        file=sys.stderr,
-        flush=True,
-    )
+    ):
+        return 1
     try:
         _put_ruleset(gh, repo, ruleset_id, payload)
     except Exception as exc:  # noqa: BLE001 - the PUT may have committed
@@ -567,7 +567,7 @@ def main(argv: list[str], gh: Callable[..., str] = run_gh) -> int:
 def _exit_status(code: object) -> int:
     if code is None:
         return 0
-    return code if isinstance(code, int) else 1
+    return code if isinstance(code, int) and 0 <= code <= 255 else 1
 
 
 def _cli(argv: list[str]) -> int:

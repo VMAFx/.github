@@ -188,8 +188,14 @@ def run_cli_with_fake_gh(scenario: str = "success") -> None:
             os.close(writer)
         raise apply_ruleset.GhError("lost PUT reply")
 
+    def mark_put(_: str) -> str:
+        os.write(1, b"PUT sent\n")
+        return "{}"
+
     if scenario == "broken stderr":
         gh.put.side_effect = fail_put
+    elif scenario == "mark PUT":
+        gh.put.side_effect = mark_put
     elif scenario == "unexpected error":
         gh.fail = RuntimeError("unexpected ruleset failure")
 
@@ -208,6 +214,7 @@ def run_fake_cli_child(
     *args: str,
     scenario: str = "success",
     close_stdout: bool = False,
+    close_stderr: bool = False,
     stdout: int = subprocess.PIPE,
 ) -> subprocess.CompletedProcess[str]:
     launch = (
@@ -223,6 +230,8 @@ def run_fake_cli_child(
         ]
         if close_stdout:
             command = ["sh", "-c", 'exec "$@" 1>&-', "sh", *command]
+        if close_stderr:
+            command = ["sh", "-c", 'exec "$@" 2>&-', "sh", *command]
         return subprocess.run(
             command, cwd=REPO_ROOT, stdout=stdout, stderr=subprocess.PIPE,
             text=True, timeout=10, check=False,
@@ -444,6 +453,17 @@ class ApplyRulesetTests(unittest.TestCase):
         gh.put.assert_called_once()
         self.assertEqual(captured.getvalue(), WRITING)
 
+    def test_absent_stderr_blocks_put(self) -> None:
+        gh = FakeGh(get_sequence=[LIVE, merged_live()])
+        out = io.StringIO()
+        with patch.object(sys, "stderr", None), redirect_stdout(out):
+            rc = apply_ruleset._write_and_verify(
+                gh, "VMAFx/.github", 7, LIVE, merged_live(), DECLARED
+            )
+        gh.put.assert_not_called()
+        self.assertEqual(rc, 1)
+        self.assertNotIn("writing ruleset", out.getvalue())
+
     def test_finding_s9_4_pointer_flushed_before_put(self) -> None:
         gh = FakeGh(get_sequence=[LIVE, merged_live()])
 
@@ -596,6 +616,13 @@ class ApplyRulesetTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, msg=result.stderr)
         self.assertEqual(result.stderr, WRITING)
 
+    @unittest.skipUnless(os.name == "posix", "closing stderr at launch requires sh")
+    def test_closed_stderr_at_launch_blocks_put(self) -> None:
+        result = run_fake_cli_child("--apply", close_stderr=True, scenario="mark PUT")
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("PUT sent", result.stdout)
+        self.assertNotIn("writing ruleset", result.stdout)
+
     @unittest.skipUnless(os.name == "posix", "closing stdout at launch requires sh")
     def test_finding_s9_2_absent_stdout_success(self) -> None:
         applied = run_fake_cli_child("--apply", close_stdout=True)
@@ -614,7 +641,8 @@ class ApplyRulesetTests(unittest.TestCase):
     def test_finding_s9_2_absent_stdout_traceback(self) -> None:
         result = run_fake_cli_child(close_stdout=True, scenario="unexpected error")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("Traceback (most recent call last):", result.stderr)
+        self.assertEqual(result.stderr.count("Traceback (most recent call last):\n"), 1)
+        self.assertEqual(result.stderr.count("RuntimeError: unexpected ruleset failure\n"), 1)
         self.assertEqual(
             result.stderr.splitlines()[-1], "RuntimeError: unexpected ruleset failure"
         )
@@ -635,7 +663,10 @@ class ApplyRulesetTests(unittest.TestCase):
         self.assertIn("unrecognized arguments: --no-such-option", unknown.stderr)
 
     def test_finding_s9_2_system_exit_codes(self) -> None:
-        for code, status in ((None, 0), (42, 42), ("message", 1)):
+        for code, status in (
+            (None, 0), (0, 0), (42, 42), (255, 255), (256, 1), (-1, 1),
+            (1 << 100, 1), (True, 1), ("message", 1),
+        ):
             with self.subTest(code=code), patch.object(
                 apply_ruleset, "main", side_effect=SystemExit(code)
             ):
