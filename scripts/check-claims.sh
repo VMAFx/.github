@@ -31,20 +31,23 @@ if [ "$rc" -ne 0 ]; then
   exit 1
 fi
 
-scratch=$(mktemp -d)
+parent=${TMPDIR:-/tmp}
+if ! resolved=$(CDPATH='' cd -P "$parent" 2>/dev/null && pwd -P); then
+  printf 'check-claims: scratch parent unreadable: %s\n' "$parent" >&2
+  exit 1
+fi
+checkout=$(pwd -P)
+case "$resolved/" in
+  "${checkout%/}/"*)
+    printf 'check-claims: scratch directory inside the checkout: %s\n' "$resolved" >&2
+    exit 1
+    ;;
+esac
+scratch=$(mktemp -d "$resolved/check-claims.XXXXXX")
 trap 'rm -r "$scratch"' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-checkout=$(pwd -P)
-scratch_path=$(CDPATH='' cd -P "$scratch" && pwd -P)
-scratch=$scratch_path
-case "$scratch/" in
-  "${checkout%/}/"*)
-    printf 'check-claims: scratch directory inside the checkout: %s\n' "$scratch" >&2
-    exit 1
-    ;;
-esac
 cp -R .vale.ini .vale "$scratch/"
 mkdir "$scratch/profile"
 readme="$scratch/profile/README.md"

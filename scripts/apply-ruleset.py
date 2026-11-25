@@ -26,22 +26,22 @@ class GhError(Exception):
 
 
 def run_gh(args: list[str], stdin: str | None = None) -> str:
-    """Run ``gh`` with a bounded wait and return stdout."""
+    """Run ``gh`` with a bounded wait, replacing invalid UTF-8 in output with U+FFFD."""
     cmd = ["gh", *args]
     try:
         result = subprocess.run(
             cmd,
-            input=stdin,
+            input=stdin.encode("utf-8") if stdin is not None else None,
             capture_output=True,
-            text=True,
             timeout=60,
             check=False,
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
         raise GhError(f"command: {cmd!r}\n{exc}") from exc
     if result.returncode != 0:
-        raise GhError(f"command: {cmd!r}\nstderr: {result.stderr.strip()}")
-    return result.stdout
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        raise GhError(f"command: {cmd!r}\nstderr: {stderr.strip()}")
+    return result.stdout.decode("utf-8", errors="replace")
 
 
 def _compact(value: Any) -> str:
@@ -372,7 +372,10 @@ def _history_report(
     except (GhError, json.JSONDecodeError) as exc:
         return False, f"history unreadable: {exc}"
     if not new:
-        return False, "ruleset history shows no new version after the write"
+        return (
+            False,
+            "ruleset history shows no new version since the initial history read",
+        )
     single = len(new) == 1
     versions = "version" if single else "versions"
     ids = ", ".join(map(str, new))

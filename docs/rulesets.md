@@ -27,7 +27,9 @@ merge have changed, the script exits with status 1 before sending the update.
 Another client can still edit the ruleset between that last read and the
 update because the [ruleset update endpoint][update] has no conditional write.
 
-After writing, the script reads the ruleset and its history again. It exits
+After a successful `PUT` response, the script reads the ruleset and its history
+again. A `PUT` error skips the ruleset read-back but still triggers the history
+read because GitHub may have recorded the update. The script exits
 with status 0 only when exactly one new version appears and the read-back
 matches the declared fields and rules, including the live-only rules and
 parameters from the original snapshot. A single new ID does not identify its
@@ -35,9 +37,8 @@ author.
 
 Every status 1 exit after the initial history read reports the failure, then
 lists all new version IDs in ascending order, reports that none appeared, or
-gives the history error. This includes a failed `PUT`, since GitHub may have
-recorded the update before the client timed out. Each history read stops at
-10 pages of 100 entries. A full tenth page makes the history unreadable.
+gives the history error. Each history read stops at 10 pages of 100 entries.
+A full tenth page makes the history unreadable.
 Inspect each reported version with the following command, restore the
 intended state from the ruleset history, then re-run the apply.
 

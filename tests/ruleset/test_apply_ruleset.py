@@ -94,11 +94,12 @@ HISTORY_POINTER = (
     "inspect each version with gh api repos/VMAFx/.github/rulesets/7/history/"
     "<version_id>, restore the intended state, then re-run\n"
 )
-SNAPSHOT_REFUSAL = (
+REFUSAL_LINE = (
     "live ruleset praetor-main-protection (7) changed since it was read; "
-    "nothing written; re-run to merge against the current state\n"
-    "ruleset history shows 1 new version (4101)"
+    "nothing written; re-run to merge against the current state"
 )
+SNAPSHOT_REFUSAL = REFUSAL_LINE + "\nruleset history shows 1 new version (4101)"
+NO_NEW_VERSION = "ruleset history shows no new version since the initial history read"
 
 
 class FakeGh:
@@ -288,9 +289,7 @@ class ApplyRulesetTests(unittest.TestCase):
     def test_failed_put_reports_history_endpoint(self) -> None:
         gh = FakeGh(get_sequence=[LIVE, LIVE], history_sequence=[[4101], [4101]])
         gh.put.side_effect = apply_ruleset.GhError("PUT failed")
-        self.assert_apply_failure(
-            gh, "PUT failed\nruleset history shows no new version after the write", 1
-        )
+        self.assert_apply_failure(gh, f"PUT failed\n{NO_NEW_VERSION}", 1)
 
     def test_put_timeout_reports_new_version(self) -> None:
         gh = FakeGh(get_sequence=[LIVE, LIVE], history_sequence=[[4101], [7303, 4101]])
@@ -378,9 +377,7 @@ class ApplyRulesetTests(unittest.TestCase):
         gh = FakeGh(
             get_sequence=[LIVE, LIVE, merged_live()], history_sequence=[[97], [97]]
         )
-        self.assert_apply_failure(
-            gh, "ruleset history shows no new version after the write", 1
-        )
+        self.assert_apply_failure(gh, NO_NEW_VERSION, 1)
 
     def test_dry_run_reads_no_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -503,6 +500,11 @@ class ApplyRulesetTests(unittest.TestCase):
         gh = FakeGh(get_sequence=[snapshot, re_read])
         self.assert_apply_failure(gh, SNAPSHOT_REFUSAL, 0)
 
+    def test_changed_snapshot_with_unchanged_history(self) -> None:
+        fresh = {**LIVE, "enforcement": "disabled"}
+        gh = FakeGh(get_sequence=[LIVE, fresh], history_sequence=[[97], [97]])
+        self.assert_apply_failure(gh, f"{REFUSAL_LINE}\n{NO_NEW_VERSION}", 0)
+
     def test_live_change_in_top_level_field_writes_nothing(self) -> None:
         re_read = json.loads(json.dumps(LIVE))
         re_read["bypass_actors"] = []
@@ -589,6 +591,32 @@ class ApplyRulesetTests(unittest.TestCase):
 
 
 class RunGhTests(unittest.TestCase):
+    def test_invalid_utf8_stdout(self) -> None:
+        cmd = ["gh", "api", "test"]
+        result = subprocess.CompletedProcess(cmd, 0, b'{"name": "\xff"}', b"")
+        with patch.object(subprocess, "run", return_value=result):
+            self.assertEqual(apply_ruleset.run_gh(cmd[1:]), '{"name": "\ufffd"}')
+
+    def test_invalid_utf8_stderr(self) -> None:
+        cmd = ["gh", "api", "test"]
+        result = subprocess.CompletedProcess(cmd, 1, b"", b"\xff boom")
+        with (
+            patch.object(subprocess, "run", return_value=result),
+            self.assertRaises(apply_ruleset.GhError) as raised,
+        ):
+            apply_ruleset.run_gh(cmd[1:])
+        self.assertEqual(
+            str(raised.exception), f"command: {cmd!r}\nstderr: \ufffd boom"
+        )
+
+    def test_binary_stdin(self) -> None:
+        cmd = ["gh", "api", "test"]
+        result = subprocess.CompletedProcess(cmd, 0, b"", b"")
+        with patch.object(subprocess, "run", return_value=result) as run:
+            apply_ruleset.run_gh(cmd[1:], stdin="{}")
+        self.assertEqual(run.call_args.kwargs["input"], b"{}")
+        self.assertNotIn("text", run.call_args.kwargs)
+
     def test_timeout_and_launch_error_include_command_and_cause(self) -> None:
         cmd = ["gh", "api", "repos/VMAFx/.github/rulesets/7"]
         for cause in (subprocess.TimeoutExpired(cmd, 60), FileNotFoundError("no gh")):
