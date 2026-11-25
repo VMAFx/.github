@@ -56,7 +56,8 @@ trap '[ -n "$scratch" ] && rm -r -- "$scratch"' EXIT
 trap 'pending=129' HUP
 trap 'pending=130' INT
 trap 'pending=143' TERM
-scratch=$(mktemp -d "$resolved/check-claims.XXXXXX") || exit 1
+scratch=$(trap '' HUP INT TERM; mktemp -d "$resolved/check-claims.XXXXXX") ||
+  exit "${pending:-1}"
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM

@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -94,6 +95,9 @@ HISTORY_POINTER = (
     "inspect each version with gh api repos/VMAFx/.github/rulesets/7/history/"
     "<version_id>, restore the intended state, then re-run\n"
 )
+WRITING = (
+    "writing ruleset praetor-main-protection (7); version history: " + HISTORY_POINTER
+)
 REFUSAL_LINE = (
     "live ruleset praetor-main-protection (7) changed since it was read; "
     "nothing written; re-run to merge against the current state"
@@ -110,7 +114,7 @@ class FakeGh:
         get_sequence: list[dict | list | str | BaseException] | None = None,
         fail: Exception | None = None,
         bad_json: bool = False,
-        history_sequence: list[list[int] | str | Exception] | None = None,
+        history_sequence: list[list[int] | str | BaseException] | None = None,
     ) -> None:
         self.calls: list[tuple[list[str], str | None]] = []
         if list_payload is None:
@@ -172,6 +176,8 @@ def run_main(
 
 class LoadGhJsonTests(unittest.TestCase):
     def test_parser_failures_keep_cause(self) -> None:
+        self.addCleanup(sys.set_int_max_str_digits, sys.get_int_max_str_digits())
+        sys.set_int_max_str_digits(4300)
         for body, cause in (
             ("[" * 200000, RecursionError),
             ("1" * 5000, ValueError),
@@ -217,7 +223,7 @@ class ApplyRulesetTests(unittest.TestCase):
                 gh,
             )
             self.assertEqual(rc, 0, msg=err)
-            self.assertEqual(err, "")
+            self.assertEqual(err, WRITING)
             puts = [call for call in gh.calls if call[0][:3] == ["api", "-X", "PUT"]]
             self.assertEqual(len(puts), 1)
             payload = json.loads(puts[0][1] or "{}")
@@ -240,7 +246,7 @@ class ApplyRulesetTests(unittest.TestCase):
                 gh,
             )
             self.assertEqual(rc, 0, msg=err)
-            self.assertEqual(err, "")
+            self.assertEqual(err, WRITING)
             self.assertEqual(gh.put.call_count, 1)
             history_calls = [
                 i
@@ -264,7 +270,7 @@ class ApplyRulesetTests(unittest.TestCase):
             self.assertLess(history_calls[0], ruleset_gets[1])
             self.assertGreater(history_calls[1], put_idx)
 
-    def apply_failure_report(self, gh: FakeGh, put_count: int) -> str:
+    def assert_apply_failure(self, gh: FakeGh, reason: str, put_count: int) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = write_json(tmp, "ruleset.json", DECLARED)
             rc, _, err = run_main(
@@ -272,30 +278,36 @@ class ApplyRulesetTests(unittest.TestCase):
             )
         self.assertEqual(rc, 1)
         self.assertEqual(gh.put.call_count, put_count)
-        return err
-
-    def assert_apply_failure(self, gh: FakeGh, reason: str, put_count: int) -> None:
-        self.assertEqual(
-            self.apply_failure_report(gh, put_count), reason + "\n" + HISTORY_POINTER
-        )
+        prefix = WRITING if put_count else ""
+        self.assertEqual(err, prefix + reason + "\n" + HISTORY_POINTER)
 
     def test_deep_readback_reports_history(self) -> None:
-        gh = FakeGh(get_sequence=[LIVE, LIVE, "[" * 200000])
-        error, report = self.apply_failure_report(gh, 1).split("\n", 1)
-        self.assertIn("read-back failed: unparseable JSON (RecursionError)", error)
-        self.assertEqual(
-            report, "ruleset history shows 1 new version (4101)\n" + HISTORY_POINTER
+        body = "[" * 200000
+        with self.assertRaises(RecursionError) as parser:
+            json.loads(body)
+        self.assert_apply_failure(
+            FakeGh(get_sequence=[LIVE, LIVE, body]),
+            f"read-back failed: unparseable JSON (RecursionError): {parser.exception}\n"
+            "ruleset history shows 1 new version (4101)",
+            1,
         )
 
     def test_oversized_history_integer_reports_pointer(self) -> None:
+        self.addCleanup(sys.set_int_max_str_digits, sys.get_int_max_str_digits())
+        sys.set_int_max_str_digits(4300)
+        body = "1" * 5000
+        with self.assertRaises(ValueError) as parser:
+            json.loads(body)
         gh = FakeGh(
             get_sequence=[LIVE, LIVE, merged_live()],
-            history_sequence=[[97], "1" * 5000],
+            history_sequence=[[97], body],
         )
-        error, pointer = self.apply_failure_report(gh, 1).split("\n", 1)
-        self.assertTrue(error.startswith("history unreadable ("), error)
-        self.assertIn("unparseable JSON (ValueError)", error)
-        self.assertEqual(pointer, HISTORY_POINTER)
+        self.assert_apply_failure(
+            gh,
+            "history unreadable (GhError): ruleset history page 1: "
+            f"unparseable JSON (ValueError): {parser.exception}",
+            1,
+        )
 
     def test_unexpected_readback_error_reports_history(self) -> None:
         gh = FakeGh(get_sequence=[LIVE, LIVE, RuntimeError("lost reply")])
@@ -320,10 +332,118 @@ class ApplyRulesetTests(unittest.TestCase):
             gh, "lost PUT reply\nruleset history shows 1 new version (4101)", 1
         )
 
-    def test_readback_interrupt_propagates(self) -> None:
-        gh = FakeGh(get_sequence=[LIVE, LIVE, KeyboardInterrupt()])
-        with self.assertRaises(KeyboardInterrupt):
-            self.apply_failure_report(gh, 1)
+    def test_write_interrupts_propagate(self) -> None:
+        for interrupt in (KeyboardInterrupt(), SystemExit(2)):
+            for stage in ("initial history", "put", "readback", "history"):
+                with self.subTest(stage=stage, interrupt=type(interrupt).__name__):
+                    gh = FakeGh(get_sequence=[LIVE, merged_live()])
+                    if stage == "initial history":
+                        gh.history.side_effect = interrupt
+                    elif stage == "put":
+                        gh.put.side_effect = interrupt
+                    elif stage == "readback":
+                        gh.get.side_effect = [LIVE, interrupt]
+                    else:
+                        gh.history.side_effect = [[97], interrupt]
+                    err = io.StringIO()
+                    with (
+                        redirect_stderr(err),
+                        self.assertRaises(type(interrupt)) as raised,
+                    ):
+                        apply_ruleset._write_and_verify(
+                            gh, "VMAFx/.github", 7, LIVE, merged_live(), DECLARED
+                        )
+                    self.assertIs(raised.exception, interrupt)
+                    put_count = 0 if stage == "initial history" else 1
+                    self.assertEqual(gh.put.call_count, put_count)
+                    self.assertEqual(err.getvalue(), WRITING if put_count else "")
+
+    def test_unprintable_readback_error_reports_history(self) -> None:
+        class LostReply(Exception):
+            def __str__(self) -> str:
+                raise ValueError("cannot format")
+
+        gh = FakeGh(get_sequence=[LIVE, LIVE, LostReply()])
+        self.assert_apply_failure(
+            gh,
+            "read-back failed (LostReply): LostReply "
+            "(message unavailable: ValueError)\n"
+            "ruleset history shows 1 new version (4101)",
+            1,
+        )
+
+    def test_history_error_after_fresh_get_refusal_propagates(self) -> None:
+        gh = FakeGh(
+            get_sequence=[{**LIVE, "enforcement": "disabled"}],
+            history_sequence=[[97], RuntimeError("lost page")],
+        )
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaisesRegex(RuntimeError, "^lost page$"):
+            apply_ruleset._write_and_verify(
+                gh, "VMAFx/.github", 7, LIVE, merged_live(), DECLARED
+            )
+        gh.put.assert_not_called()
+        self.assertEqual(err.getvalue(), "")
+
+    def test_unprintable_formatting_error_leaves_bare_name(self) -> None:
+        class NoName(type):
+            @property
+            def __name__(cls) -> str:
+                raise ValueError("cannot read class name")
+
+        class FormattingError(Exception, metaclass=NoName):
+            pass
+
+        class LostReply(Exception):
+            def __str__(self) -> str:
+                raise FormattingError()
+
+        self.assertEqual(apply_ruleset._describe(LostReply()), "LostReply")
+
+    def test_unserializable_payload_writes_nothing(self) -> None:
+        desired = merged_live()
+        desired["rules"][-1]["parameters"]["bad"] = object()
+        gh = FakeGh()
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(TypeError):
+            apply_ruleset._write_and_verify(
+                gh, "VMAFx/.github", 7, LIVE, desired, DECLARED
+            )
+        gh.put.assert_not_called()
+        self.assertEqual(err.getvalue(), "")
+
+    def test_broken_success_output_reports_history(self) -> None:
+        gh = FakeGh(get_sequence=[LIVE, merged_live()])
+        out = Mock()
+        out.write.side_effect = BrokenPipeError("pipe closed")
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = apply_ruleset._write_and_verify(
+                gh, "VMAFx/.github", 7, LIVE, merged_live(), DECLARED
+            )
+        self.assertEqual(rc, 1)
+        gh.put.assert_called_once()
+        self.assertEqual(
+            err.getvalue(),
+            WRITING + "pipe closed\nruleset history shows 1 new version (4101)\n"
+            + HISTORY_POINTER,
+        )
+
+    def test_broken_success_output_and_stderr_return_failure(self) -> None:
+        gh = FakeGh(get_sequence=[LIVE, merged_live()])
+        err = Mock(wraps=io.StringIO())
+
+        def close_outputs(_: str) -> None:
+            err.write.side_effect = BrokenPipeError("stderr closed")
+            raise BrokenPipeError("stdout closed")
+
+        out = Mock()
+        out.write.side_effect = close_outputs
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = apply_ruleset._write_and_verify(
+                gh, "VMAFx/.github", 7, LIVE, merged_live(), DECLARED
+            )
+        self.assertEqual(rc, 1)
         gh.put.assert_called_once()
 
     def test_foreign_write_before_put_stops(self) -> None:
@@ -481,7 +601,7 @@ class ApplyRulesetTests(unittest.TestCase):
                 gh,
             )
             self.assertEqual(rc, 0, msg=err)
-            self.assertEqual(err, "")
+            self.assertEqual(err, WRITING)
             puts = [call for call in gh.calls if call[0][:3] == ["api", "-X", "PUT"]]
             self.assertEqual(len(puts), 1)
             payload = json.loads(puts[0][1] or "{}")
@@ -553,7 +673,11 @@ class ApplyRulesetTests(unittest.TestCase):
                 gh,
             )
             self.assertEqual(rc, 1)
-            self.assertNotEqual(err, "")
+            self.assertEqual(
+                err,
+                "ruleset list: unparseable JSON (JSONDecodeError): "
+                "Expecting value: line 1 column 1 (char 0)\n",
+            )
             puts = [call for call in gh.calls if call[0][:3] == ["api", "-X", "PUT"]]
             self.assertEqual(puts, [])
 
@@ -648,7 +772,7 @@ class ApplyRulesetTests(unittest.TestCase):
                 gh,
             )
             self.assertEqual(rc, 0, msg=err)
-            self.assertEqual(err, "")
+            self.assertEqual(err, WRITING)
             puts = [call for call in gh.calls if call[0][:3] == ["api", "-X", "PUT"]]
             self.assertEqual(len(puts), 1)
             self.assertIn("declared rules match", out)

@@ -331,9 +331,8 @@ def _print_kept_live_rules(live: dict[str, Any], declared: dict[str, Any]) -> No
 
 
 def _put_ruleset(
-    gh: Callable[..., str], repo: str, ruleset_id: int, desired: dict[str, Any]
+    gh: Callable[..., str], repo: str, ruleset_id: int, payload: str
 ) -> None:
-    payload = json.dumps(desired)
     gh(
         ["api", "-X", "PUT", f"repos/{repo}/rulesets/{ruleset_id}", "--input", "-"],
         payload,
@@ -373,10 +372,33 @@ def _locate_ruleset(gh: Callable[..., str], repo: str, name: str) -> int | None:
     return None
 
 
+def _exception_name(exc: BaseException) -> str:
+    # Read the actual class name even if its metaclass overrides attribute access.
+    return str.__str__(type.__dict__["__name__"].__get__(type(exc)))
+
+
+def _describe(exc: BaseException) -> str:
+    try:
+        # A str subclass returned by __str__ could override __format__.
+        return str.__str__(str(exc))
+    except Exception as error:  # noqa: BLE001 - formatting can raise any Exception
+        name = _exception_name(exc)
+        try:
+            return f"{name} (message unavailable: {type(error).__name__})"
+        except Exception:  # noqa: BLE001 - keep the original exception's name
+            return name
+
+
 def _history_report(
-    gh: Callable[..., str], repo: str, ruleset_id: int, before: set[int]
+    gh: Callable[..., str],
+    repo: str,
+    ruleset_id: int,
+    before: set[int],
+    *,
+    after_write: bool,
 ) -> tuple[bool, str]:
     """Return whether exactly one version appeared and the diagnostic line."""
+    reportable = Exception if after_write else GhError
     try:
         new = sorted(fetch_history_ids(gh, repo, ruleset_id) - before)
         if not new:
@@ -388,10 +410,10 @@ def _history_report(
         versions = "version" if single else "versions"
         ids = ", ".join(map(str, new))
         return single, f"ruleset history shows {len(new)} new {versions} ({ids})"
-    except Exception as exc:  # noqa: BLE001 - keep the recovery pointer available
+    except reportable as exc:
         if isinstance(exc, GhError) and not isinstance(exc.__cause__, GH_JSON_ERRORS):
-            return False, f"history unreadable: {exc}"
-        return False, f"history unreadable ({type(exc).__name__}): {exc}"
+            return False, f"history unreadable: {_describe(exc)}"
+        return False, f"history unreadable ({_exception_name(exc)}): {_describe(exc)}"
 
 
 def _verify_write(
@@ -407,16 +429,24 @@ def _verify_write(
         readback = fetch_ruleset(gh, repo, ruleset_id, readback=True)
         errors = readback_errors(readback, declared, live)
     except GhError as exc:
-        errors = [str(exc)]
+        errors = [_describe(exc)]
     except Exception as exc:  # noqa: BLE001 - history still needs to be read
-        errors = [f"read-back failed ({type(exc).__name__}): {exc}"]
+        errors = [f"read-back failed ({_exception_name(exc)}): {_describe(exc)}"]
 
-    single, history = _history_report(gh, repo, ruleset_id, before)
+    single, history = _history_report(gh, repo, ruleset_id, before, after_write=True)
     if single and not errors:
-        print(f"read-back: {len(declared['rules'])} declared rules match")
-        return 0
+        try:
+            print(
+                f"read-back: {len(declared['rules'])} declared rules match", flush=True
+            )
+            return 0
+        except OSError as exc:
+            errors = [_describe(exc)]
     pointer = _history_pointer(repo, ruleset_id)
-    print(*errors, history, pointer, sep="\n", file=sys.stderr)
+    try:
+        print(*errors, history, pointer, sep="\n", file=sys.stderr)
+    except OSError:
+        pass  # The history pointer was printed before the PUT.
     return 1
 
 
@@ -435,9 +465,11 @@ def _write_and_verify(
         print(f"history unreadable: {exc}", pointer, sep="\n", file=sys.stderr)
         return 1
 
-    def report_failure(exc: Exception) -> int:
-        _, history = _history_report(gh, repo, ruleset_id, before)
-        print(exc, history, pointer, sep="\n", file=sys.stderr)
+    def report_failure(exc: Exception, *, after_write: bool) -> int:
+        _, history = _history_report(
+            gh, repo, ruleset_id, before, after_write=after_write
+        )
+        print(_describe(exc), history, pointer, sep="\n", file=sys.stderr)
         return 1
 
     try:
@@ -448,12 +480,19 @@ def _write_and_verify(
                 "read; nothing written; re-run to merge against the current state"
             )
     except GhError as exc:
-        return report_failure(exc)
+        return report_failure(exc, after_write=False)
 
+    payload = json.dumps(desired)
+    print(
+        f"writing ruleset {declared['name']} ({ruleset_id}); "
+        f"version history: {pointer}",
+        file=sys.stderr,
+        flush=True,
+    )
     try:
-        _put_ruleset(gh, repo, ruleset_id, desired)
+        _put_ruleset(gh, repo, ruleset_id, payload)
     except Exception as exc:  # noqa: BLE001 - the PUT may have committed
-        return report_failure(exc)
+        return report_failure(exc, after_write=True)
     return _verify_write(gh, repo, ruleset_id, live, declared, before)
 
 
