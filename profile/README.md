@@ -27,7 +27,7 @@
 
 </div>
 
-VMAFx is a fork of [Netflix/vmaf](https://github.com/Netflix/vmaf). Netflix's own reference tests run as a [required check on every pull request](https://github.com/VMAFx/vmafx/blob/master/docs/principles.md#31-netflix-golden-data-gate), so the CPU scores stay the reference scores. On top of that, VMAFx scores on NVIDIA, Intel, AMD and Apple GPUs and compares each GPU version of a metric with the CPU's result: the [exact twins](https://github.com/VMAFx/vmafx/blob/master/docs/development/cross-backend-exact-twins.md) return the same bits, and the rest are held to the [published tolerance](https://github.com/VMAFx/vmafx/blob/master/docs/development/cross-backend-gate.md#tolerance-contract).
+VMAFx is a fork of [Netflix/vmaf](https://github.com/Netflix/vmaf). Every pull request requires the [Netflix golden check](https://github.com/VMAFx/vmafx/blob/master/.github/workflows/tests-and-quality-gates.yml). It runs Netflix's reference tests when a change touches the scoring path. VMAFx scores on NVIDIA, Intel, AMD and Apple GPUs and compares each GPU version of a metric with the CPU's result: the [exact twins](https://github.com/VMAFx/vmafx/blob/master/docs/development/cross-backend-exact-twins.md) return the same bits, and the rest are held to the [published tolerance](https://github.com/VMAFx/vmafx/blob/master/docs/development/cross-backend-gate.md#tolerance-contract).
 
 **[📖 Documentation](https://vmafx.github.io/vmafx/)** · **[🗺️ Roadmap](https://vmafx.github.io/vmafx/roadmap/)** · **[🚀 First score](https://vmafx.github.io/vmafx/getting-started/first-score/)** · **[💬 Discussions](https://github.com/VMAFx/vmafx/discussions)**
 
@@ -57,7 +57,7 @@ VMAFx is a fork of [Netflix/vmaf](https://github.com/Netflix/vmaf). Netflix's ow
 
 ## Roadmap and releases
 
-The release badge above, the [roadmap](https://vmafx.github.io/vmafx/roadmap/) and the [milestones](https://github.com/VMAFx/vmafx/milestones) are where releases are tracked. This page doesn't repeat them, so it can't go stale.
+The release badge above, the [roadmap](https://vmafx.github.io/vmafx/roadmap/) and the [milestones](https://github.com/VMAFx/vmafx/milestones) are where releases are tracked.
 
 ## Upstream and licences
 

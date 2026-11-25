@@ -9,7 +9,12 @@
 # that no longer reports the planted claims.
 set -eu
 
-PLANTED_EXPECTED=8
+for path in profile/README.md tests/claims/qualified.md tests/claims/planted.md; do
+  if [ ! -f "$path" ]; then
+    echo "check-claims: missing required file: $path" >&2
+    exit 1
+  fi
+done
 
 if ! command -v vale >/dev/null 2>&1; then
   echo "check-claims: vale is not installed; install it (https://vale.sh/docs/install/)" \
@@ -37,15 +42,28 @@ if [ "$rc" -ne 0 ]; then
   exit 1
 fi
 
+# One VMAFx.AbsoluteClaim report per expected match, in any order.
+set -- "same score" "every device" "Every Vendor" "bit-for-bit" \
+  "all GPUs" "always" "guaranteed" "bit exact"
 rc=0
 out=$(lint tests/claims/planted.md) || rc=$?
 hits=$(printf '%s\n' "$out" | awk '/:VMAFx[.]AbsoluteClaim:/ { n++ } END { print n + 0 }')
-if [ "$rc" -ne 1 ] || [ "$hits" -ne "$PLANTED_EXPECTED" ]; then
+if [ "$rc" -ne 1 ] || [ "$hits" -ne "$#" ]; then
   printf '%s\n' "$out" >&2
   echo "check-claims: tests/claims/planted.md gave rc $rc (want 1)" \
-    "and $hits reports (want $PLANTED_EXPECTED)" >&2
+    "and $hits reports (want $#)" >&2
   exit 1
 fi
 
+for phrase do
+  case "$out" in
+    *":VMAFx.AbsoluteClaim:Absolute claim '$phrase':"*) ;;
+    *)
+      echo "check-claims: tests/claims/planted.md missing report for '$phrase'" >&2
+      exit 1
+      ;;
+  esac
+done
+
 echo "check-claims: profile clean; qualified fixture clean;" \
-  "planted fixture reported $hits of $PLANTED_EXPECTED"
+  "planted fixture reported $hits of $#"

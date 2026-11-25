@@ -170,38 +170,25 @@ def _other_version(
     ruleset_id: int,
     new_ids: list[int],
     payload: dict[str, Any],
-) -> tuple[tuple[int, dict[str, Any]] | None, list[str]]:
-    pointer = _history_pointer(repo, ruleset_id)
-    own: list[int] = []
-    other: list[tuple[int, dict[str, Any]]] = []
-    for version_id in new_ids:
-        state = fetch_version_state(gh, repo, ruleset_id, version_id)
-        if _matches_payload(state, payload):
-            own.append(version_id)
-        else:
-            other.append((version_id, state))
-    if not own:
-        found = ", ".join(str(version) for version in new_ids)
-        return (
-            None,
-            [
-                f"cannot find this write among the new ruleset versions ({found}); "
-                f"{pointer}"
-            ],
-        )
+) -> tuple[list[tuple[int, dict[str, Any]]], str]:
+    """Return versions to inspect and a reason if recovery cannot proceed."""
+    states = [
+        (version, fetch_version_state(gh, repo, ruleset_id, version))
+        for version in new_ids
+    ]
+    other = [
+        (version, state)
+        for version, state in states
+        if not _matches_payload(state, payload)
+    ]
+    matches = len(states) - len(other)
+    if matches == 0:
+        return states, "cannot find this write among the new ruleset versions"
+    if matches > 1:
+        return states, f"{matches} new ruleset versions match this write"
     if len(other) > 1:
-        found = ", ".join(str(version) for version, _ in other)
-        return (
-            None,
-            [
-                f"{len(other)} new ruleset versions from other clients ({found}) "
-                f"differ from this write; {pointer}"
-            ],
-        )
-    if not other:
-        return (None, [])
-    version_id, state = other[0]
-    return ((version_id, state), [])
+        return other, f"{len(other)} new ruleset versions differ from this write"
+    return other, ""
 
 
 def find_ruleset_id(entries: list[dict[str, Any]], name: str) -> int | None:
@@ -445,27 +432,40 @@ def _write_round(
     base: dict[str, Any],
     payload: dict[str, Any],
     before: set[int],
+    foreign_ids: list[int],
 ) -> int | tuple[int, dict[str, Any], set[int]]:
     """Return an exit code or the foreign version, its state and updated history."""
-    _put_ruleset(gh, repo, ruleset_id, payload)
-    readback = fetch_ruleset(gh, repo, ruleset_id)
-    after = fetch_history_ids(gh, repo, ruleset_id)
-    new = sorted(after - before)
-    if len(new) == 1:
-        return _finish_readback(readback, declared, base)
-    if not new:
-        for message in concurrent_write_errors(repo, ruleset_id, before, after):
-            print(message, file=sys.stderr)
-        return 1
-    other, errors = _other_version(gh, repo, ruleset_id, new, payload)
-    if errors:
-        for message in errors:
-            print(message, file=sys.stderr)
-        return 1
-    if other is None:
-        return _finish_readback(readback, declared, base)
-    version_id, state = other
-    return version_id, state, after
+    pointer = _history_pointer(repo, ruleset_id)
+    candidates: list[int] = []
+    try:
+        _put_ruleset(gh, repo, ruleset_id, payload)
+        readback = fetch_ruleset(gh, repo, ruleset_id)
+        after = fetch_history_ids(gh, repo, ruleset_id)
+        new = sorted(after - before)
+        if not new:
+            (message,) = concurrent_write_errors(repo, ruleset_id, before, after)
+        elif len(new) == 1:
+            rc = _finish_readback(readback, declared, base)
+            if rc == 0 or not foreign_ids:
+                return rc
+            message = f"recovery read-back failed; {pointer}"
+        else:
+            candidates = new
+            versions, reason = _other_version(gh, repo, ruleset_id, new, payload)
+            if not reason:
+                version_id, state = versions[0]
+                return version_id, state, after
+            candidates = [version for version, _ in versions]
+            message = f"{reason}; {pointer}"
+    except (GhError, json.JSONDecodeError) as exc:
+        message = f"{exc}; {pointer}"
+
+    ids = [*foreign_ids, *candidates]
+    if ids:
+        found = ", ".join(str(version) for version in ids)
+        message = f"ruleset versions ({found}): {message}"
+    print(message, file=sys.stderr)
+    return 1
 
 
 def _write_and_verify(
@@ -489,7 +489,9 @@ def _write_and_verify(
     payload = desired
     foreign_ids: list[int] = []
     for write_number in range(1, MAX_WRITE_ROUNDS + 1):
-        result = _write_round(gh, repo, ruleset_id, declared, base, payload, before)
+        result = _write_round(
+            gh, repo, ruleset_id, declared, base, payload, before, foreign_ids
+        )
         if isinstance(result, int):
             return result
         version_id, base, before = result

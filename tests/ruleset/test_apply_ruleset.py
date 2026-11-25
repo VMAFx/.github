@@ -98,6 +98,7 @@ class FakeGh:
         bad_json: bool = False,
         history: list[int] | None = None,
         foreign_writes: dict[int, list[tuple[str, dict | None]]] | None = None,
+        version_ids: tuple[int, ...] | None = None,
         put_adds_version: bool = True,
         bad_history: bool = False,
         own_state_change: dict | None = None,
@@ -112,6 +113,7 @@ class FakeGh:
         self.bad_json = bad_json
         self.history = list(history) if history is not None else [100]
         self.foreign_writes = foreign_writes
+        self.version_ids = iter(version_ids) if version_ids is not None else None
         self.put_adds_version = put_adds_version
         self.bad_history = bad_history
         self.own_state_change = own_state_change
@@ -171,7 +173,10 @@ class FakeGh:
         return json.dumps(entries)
 
     def _append_version(self, state: dict | None) -> int:
-        new_id = max(self.history, default=0) + 1
+        if self.version_ids is None:
+            new_id = max(self.history, default=0) + 1
+        else:
+            new_id = next(self.version_ids)
         self.history.append(new_id)
         if state is not None:
             self.states[new_id] = state
@@ -351,7 +356,7 @@ class ApplyRulesetTests(unittest.TestCase):
             types = {rule["type"] for rule in payload["rules"]}
             self.assertIn("copilot_code_review", types)
 
-    def test_foreign_version_equal_to_write_is_accepted(self) -> None:
+    def test_identical_writes_fail_closed(self) -> None:
         foreign = merged_live()
         with tempfile.TemporaryDirectory() as tmp:
             path = write_json(tmp, "ruleset.json", DECLARED)
@@ -363,9 +368,10 @@ class ApplyRulesetTests(unittest.TestCase):
                 ["--repo", "VMAFx/.github", "--file", str(path), "--apply"],
                 gh,
             )
-            self.assertEqual(rc, 0, msg=err)
-            puts = [c for c in gh.calls if c[0][:3] == ["api", "-X", "PUT"]]
-            self.assertEqual(len(puts), 1)
+            self.assertEqual(rc, 1)
+            self.assertEqual(gh.put_count, 1)
+            self.assertIn("(101, 102)", err)
+            self.assertIn("repos/VMAFx/.github/rulesets/7/history/<version_id>", err)
 
     def test_second_foreign_write_stops_recovery(self) -> None:
         initial_put = merged_live()
@@ -374,11 +380,12 @@ class ApplyRulesetTests(unittest.TestCase):
         recovery_put = apply_ruleset.merge_ruleset(first, DECLARED)
         with tempfile.TemporaryDirectory() as tmp:
             path = write_json(tmp, "ruleset.json", DECLARED)
-            for timing, version_id in (("before", 103), ("after", 104)):
+            for timing, version_id in (("before", 7303), ("after", 9004)):
                 with self.subTest(timing=timing):
                     readback = recovery_put if timing == "before" else second
                     gh = FakeGh(
-                        get_sequence=[LIVE, LIVE, initial_put, readback, second],
+                        get_sequence=[LIVE, LIVE, initial_put, readback],
+                        version_ids=(4101, 5102, 7303, 9004),
                         foreign_writes={0: [("before", first)], 1: [(timing, second)]},
                     )
                     rc, _, err = run_main(
@@ -387,9 +394,50 @@ class ApplyRulesetTests(unittest.TestCase):
                     )
                     self.assertEqual(rc, 1)
                     self.assertEqual(gh.put_count, 2)
-                    self.assertIn("101", err)
-                    self.assertIn(str(version_id), err)
-                    self.assertIn("history/<version_id>", err)
+                    self.assertEqual(
+                        err,
+                        f"other clients wrote ruleset versions (4101, {version_id}) "
+                        "during both writes; inspect each version with gh api "
+                        "repos/VMAFx/.github/rulesets/7/history/<version_id>, "
+                        "restore the intended state, then re-run\n",
+                    )
+
+    def test_recovery_errors_report_all_versions(self) -> None:
+        first = {**LIVE, "rules": [*LIVE["rules"], {"type": "creation"}]}
+        initial = merged_live()
+        recovery = apply_ruleset.merge_ruleset(first, DECLARED)
+        cases = (
+            ([], recovery, "(4101)", "no new version"),
+            ([recovery, recovery], recovery, "(4101, 7303, 9004)", "match"),
+            ([recovery, LIVE, recovery], recovery, "(4101, 7303, 9004, 9517)", "match"),
+            ([LIVE, first], first, "(4101, 7303, 9004)", "cannot find this write"),
+            ([LIVE, recovery, first], first, "(4101, 7303, 9517)", "differ"),
+            ([None, recovery], recovery, "(4101, 7303, 9004)", "has no state"),
+            ([recovery], initial, "(4101)", "missing after read-back"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_json(tmp, "ruleset.json", DECLARED)
+            for states, readback, ids, reason in cases:
+                with self.subTest(reason=reason, ids=ids):
+                    gh = FakeGh(
+                        get_sequence=[LIVE, LIVE, initial, readback],
+                        version_ids=(4101, 5102, 7303, 9004, 9517),
+                        put_adds_version=False,
+                        foreign_writes={
+                            0: [("before", first), ("after", initial)],
+                            1: [("after", state) for state in states],
+                        },
+                    )
+                    rc, _, err = run_main(
+                        ["--repo", "VMAFx/.github", "--file", str(path), "--apply"], gh
+                    )
+                    self.assertEqual(rc, 1)
+                    self.assertEqual(gh.put_count, 2)
+                    self.assertIn(reason, err)
+                    self.assertIn(ids, err)
+                    self.assertIn(
+                        "repos/VMAFx/.github/rulesets/7/history/<version_id>", err
+                    )
 
     def test_foreign_writes_every_round_fail_closed(self) -> None:
         foreign = json.loads(json.dumps(LIVE))
@@ -399,6 +447,7 @@ class ApplyRulesetTests(unittest.TestCase):
             path = write_json(tmp, "ruleset.json", DECLARED)
             gh = FakeGh(
                 get_sequence=[LIVE, LIVE, merged_live(), merged_after],
+                version_ids=(4101, 5102, 7303, 9004),
                 foreign_writes={0: [("before", foreign)], 1: [("before", foreign)]},
             )
             rc, _, err = run_main(
@@ -407,9 +456,8 @@ class ApplyRulesetTests(unittest.TestCase):
             )
             self.assertEqual(rc, 1)
             self.assertEqual(gh.put_count, 2)
-            self.assertIn("101", err)
-            self.assertIn("103", err)
-            self.assertIn("history/<version_id>", err)
+            self.assertIn("(4101, 7303)", err)
+            self.assertIn("repos/VMAFx/.github/rulesets/7/history/<version_id>", err)
 
     def test_own_version_not_found_fails_closed(self) -> None:
         foreign = json.loads(json.dumps(LIVE))

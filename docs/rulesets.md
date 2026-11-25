@@ -44,17 +44,18 @@ any value from the declared file did not take effect.
   read and again after the read-back. When more than one new version appeared,
   it reads each new version's state
   (`GET /repos/{owner}/{repo}/rulesets/{ruleset_id}/history/{version_id}`),
-  takes its own write to be the version whose state equals the payload it sent,
-  and on the first overlap merges the other version's state with the declared
-  file and writes again. A rule the other client added is kept and a declared
-  rule it removed comes back. The script writes at most twice. If another write
-  overlaps the recovery write, it exits with status 1 and lists every foreign
-  version id for manual restoration. Merging the second state could drop a rule
+  and attributes its write only if exactly one state matches its payload.
+  If one other version appeared on the first write, the script merges that
+  version's state with the declared file and writes once more. This preserves
+  rules the other client added and restores declared rules it removed.
+  A second overlap stops recovery because another merge could drop a rule
   the first writer added (see `test_second_foreign_write_stops_recovery`).
-  It exits with status 1 and lists the version ids to inspect when no new
-  version appeared, when it cannot find its own version, or when more than one
-  other version differs from its payload. A write by another client after the
-  final read-back is not checked; the next run reconciles it.
+  Recovery also stops if no version appeared, if zero or multiple versions
+  match the payload, or if multiple other versions differ from it. On failure
+  the script exits with status 1. It lists the known foreign versions and any
+  unattributed candidates from both writes, with the history endpoint for
+  manual restoration. A write by another client after
+  the final read-back is not checked; the next run reconciles it.
 - You need the `gh` CLI authenticated with administration permission on the
   repository.
 - Tests: `python3 -B -m unittest discover -s tests/ruleset -t .`
