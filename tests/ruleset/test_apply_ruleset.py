@@ -1085,6 +1085,36 @@ class ApplyRulesetTests(unittest.TestCase):
 
 
 class RunGhTests(unittest.TestCase):
+    def test_passes_arg_list_without_shell_or_executable(self) -> None:
+        result = subprocess.CompletedProcess(["gh", "api", "x"], 0, b"ok", b"")
+        with patch.object(subprocess, "run", return_value=result) as run:
+            out = apply_ruleset.run_gh(["api", "x"])
+        self.assertEqual(out, "ok")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args, (["gh", "api", "x"],))
+        self.assertIs(type(run.call_args.args[0]), list)
+        self.assertNotIn("shell", run.call_args.kwargs)
+        self.assertNotIn("executable", run.call_args.kwargs)
+
+    def test_empty_args_runs_bare_gh(self) -> None:
+        result = subprocess.CompletedProcess(["gh"], 0, b"", b"")
+        with patch.object(subprocess, "run", return_value=result) as run:
+            self.assertEqual(apply_ruleset.run_gh([]), "")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args, (["gh"],))
+        self.assertIs(type(run.call_args.args[0]), list)
+
+    def test_shell_metacharacters_passed_unchanged(self) -> None:
+        expected = ["gh", "api", "x; echo injected && id"]
+        result = subprocess.CompletedProcess(expected, 0, b"", b"")
+        with patch.object(subprocess, "run", return_value=result) as run:
+            self.assertEqual(apply_ruleset.run_gh(["api", "x; echo injected && id"]), "")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args, (expected,))
+        self.assertEqual(len(run.call_args.args[0]), 3)
+        self.assertEqual(run.call_args.args[0][2], "x; echo injected && id")
+        self.assertNotIn("shell", run.call_args.kwargs)
+
     def test_invalid_utf8_stdout(self) -> None:
         cmd = ["gh", "api", "test"]
         result = subprocess.CompletedProcess(cmd, 0, b'{"name": "\xff"}', b"")

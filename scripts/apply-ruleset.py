@@ -33,7 +33,7 @@ def run_gh(args: list[str], stdin: str | None = None) -> str:
     cmd = ["gh", *args]
     try:
         result = subprocess.run(
-            cmd,
+            ["gh", *args],
             input=stdin.encode("utf-8") if stdin is not None else None,
             capture_output=True,
             timeout=60,
