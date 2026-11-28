@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@proton.me>
+# SPDX-License-Identifier: EUPL-1.2
+#
+# VMAFx.AbsoluteClaim (docs/adr/0001-absolute-claim-check.md): a universal
+# claim about scores, devices or vendors needs the scope its evidence proves.
+# A phrase whose universal form is proven goes under `exceptions`, with the
+# evidence path in a comment above it.
+extends: existence
+message: >-
+  Absolute claim '%s': state the scope the linked evidence proves,
+  or add a reviewed exception (ADR-0001).
+link: https://github.com/VMAFx/.github/blob/master/docs/adr/0001-absolute-claim-check.md
+level: error
+ignorecase: true
+scope: sentence
+tokens:
+  - every (?:device|vendor|GPU|backend|platform|change|frame)s?
+  - all (?:devices|vendors|GPUs|backends|platforms)
+  - bit[- ]for[- ]bit
+  - bit[- ]exact
+  - same (?:score|answer|result)s?
+  - always
+  - never
+  - guarantee[sd]?

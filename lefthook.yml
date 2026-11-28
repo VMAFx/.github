@@ -46,6 +46,14 @@ pre-commit:
       run: sh .config/lefthook/engine.sh compile-context --verify
     hiss-audit:
       run: sh .config/lefthook/engine.sh audit --offline
+    claims:
+      # Absolute-claim check on the profile (docs/adr/0001-absolute-claim-check.md).
+      glob: "{profile/*.md,.vale.ini,.vale/**,tests/claims/*.md,scripts/check-claims.sh}"
+      run: sh scripts/check-claims.sh
+    ruleset-apply:
+      # Ruleset apply script tests (docs/rulesets.md).
+      glob: "{scripts/apply-ruleset.py,tests/ruleset/*.py,.github/rulesets/*.json}"
+      run: sh .config/lefthook/python.sh -B -m unittest discover -s tests/ruleset -t .
 
 post-commit:
   commands:
