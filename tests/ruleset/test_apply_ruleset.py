@@ -1133,5 +1133,118 @@ class RunGhTests(unittest.TestCase):
         self.assertIs(raised.exception, interrupt)
 
 
+class EmitTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "nonblocking pipes require POSIX")
+    def test_full_nonblocking_unbuffered_pipe_returns_false(self) -> None:
+        reader, writer = os.pipe()
+        with (
+            os.fdopen(reader, "rb"),
+            io.TextIOWrapper(
+                io.FileIO(writer, "w"), encoding="utf-8", write_through=True
+            ) as stream,
+        ):
+            os.set_blocking(writer, False)
+            chunk = b"x" * 65536
+            for _ in range(4096):
+                try:
+                    os.write(writer, chunk)
+                except BlockingIOError:
+                    break
+            with self.assertRaises(BlockingIOError):
+                os.write(writer, b"x")
+            self.assertFalse(apply_ruleset._emit(stream, "x"))
+
+    def test_pipe_with_room_delivers_exact_line(self) -> None:
+        reader, writer = os.pipe()
+        text = "history pointer"
+        with os.fdopen(reader, "r", encoding="utf-8", newline="") as pipe_in:
+            with io.TextIOWrapper(
+                io.FileIO(writer, "w"), encoding="utf-8", write_through=True
+            ) as stream:
+                self.assertTrue(apply_ruleset._emit(stream, text))
+            self.assertEqual(pipe_in.read(), text + "\n")
+
+    def test_descriptor_backslashreplace_encodes_unrepresentable_text(self) -> None:
+        reader, writer = os.pipe()
+        with os.fdopen(reader, "rb") as pipe_in:
+            with io.TextIOWrapper(
+                io.FileIO(writer, "w"), encoding="ascii", write_through=True
+            ) as stream:
+                self.assertTrue(apply_ruleset._emit(stream, "caf\u00e9"))
+            self.assertEqual(pipe_in.read(), b"caf\\xe9\n")
+
+    def test_descriptor_partial_and_zero_writes(self) -> None:
+        reader, writer = os.pipe()
+        real_write = os.write
+        text = "partial \u00e9"
+        expected = (text + "\n").encode("utf-8")
+
+        def write_one_byte(fd: int, data: bytes | memoryview) -> int:
+            return real_write(fd, memoryview(data)[:1])
+
+        with os.fdopen(reader, "rb") as pipe_in:
+            with io.TextIOWrapper(
+                io.FileIO(writer, "w"), encoding="utf-8", write_through=True
+            ) as stream:
+                with patch("os.write", side_effect=write_one_byte) as single_byte:
+                    self.assertTrue(apply_ruleset._emit(stream, text))
+                self.assertEqual(single_byte.call_count, len(expected))
+                with patch("os.write", return_value=0) as zero_write:
+                    self.assertFalse(apply_ruleset._emit(stream, text))
+                zero_write.assert_called_once()
+            self.assertEqual(pipe_in.read(), expected)
+
+    def test_buffered_text_flushes_before_emitted_line(self) -> None:
+        reader, writer = os.pipe()
+        with os.fdopen(reader, "rb") as pipe_in:
+            with io.TextIOWrapper(
+                io.BufferedWriter(io.FileIO(writer, "w")),
+                encoding="utf-8",
+                newline="\n",
+            ) as stream:
+                stream.write("earlier ")
+                self.assertTrue(apply_ruleset._emit(stream, "emitted"))
+                self.assertEqual(os.read(reader, 4096), b"earlier emitted\n")
+            self.assertEqual(pipe_in.read(), b"")
+
+
+class ExitStatusTests(unittest.TestCase):
+    def test_lying_int_subclass_returns_one(self) -> None:
+        class Lying(int):
+            def __le__(self, _other: object) -> bool:
+                return True
+
+            def __ge__(self, _other: object) -> bool:
+                return True
+
+            def __index__(self) -> int:
+                return 0
+
+        result = apply_ruleset._exit_status(Lying(256))
+        self.assertEqual(result, 1)
+        self.assertIs(type(result), int)
+
+    def test_exit_status_values_and_exact_int_type(self) -> None:
+        class SubInt(int):
+            pass
+
+        cases: tuple[tuple[object, int], ...] = (
+            (SubInt(3), 3),
+            (False, 0),
+            (True, 1),
+            (0, 0),
+            (255, 255),
+            (256, 1),
+            (-1, 1),
+            (None, 0),
+            ("x", 1),
+        )
+        for code, expected in cases:
+            with self.subTest(code=repr(code), kind=type(code).__name__):
+                result = apply_ruleset._exit_status(code)
+                self.assertIs(type(result), int)
+                self.assertEqual(result, expected)
+
+
 if __name__ == "__main__":
     unittest.main()

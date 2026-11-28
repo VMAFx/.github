@@ -393,16 +393,53 @@ def _describe(exc: BaseException) -> str:
             return name
 
 
-def _emit(stream: TextIO | None, text: str) -> bool:
-    if stream is None:
-        return False
+def _emit_text(stream: TextIO, text: str) -> bool:
     try:
         line = text + "\n"
         written = stream.write(line)
         stream.flush()
-        return written == len(line)
+        return not issubclass(type(written), bool) and written == len(line)
     except Exception:  # noqa: BLE001 - the pre-PUT pointer survives a failed report
         return False
+
+
+def _emit_descriptor(stream: TextIO, fd: int, text: str) -> bool:
+    try:
+        if getattr(stream, "closed", False) is True:
+            return False
+        stream.flush()
+        raw_encoding = getattr(stream, "encoding", None)
+        encoding = (
+            raw_encoding if isinstance(raw_encoding, str) and raw_encoding else "utf-8"
+        )
+        data = (text + "\n").encode(encoding, errors="backslashreplace")
+        view = memoryview(data)
+        for _ in range(len(data)):
+            written = os.write(fd, view)
+            if written <= 0:
+                return False
+            view = view[written:]
+            if not view:
+                return True
+        return not view
+    except Exception:  # noqa: BLE001 - the pre-PUT pointer survives a failed report
+        return False
+
+
+def _emit(stream: TextIO | None, text: str) -> bool:
+    if stream is None:
+        return False
+    try:
+        fd = stream.fileno()
+    except Exception:  # noqa: BLE001 - non-descriptor streams fall back to text I/O
+        fd = None
+    if (
+        not issubclass(type(fd), bool)
+        and issubclass(type(fd), int)
+        and isinstance(fd, int)
+    ):
+        return _emit_descriptor(stream, int.__index__(fd), text)
+    return _emit_text(stream, text)
 
 
 def _history_report(
@@ -567,7 +604,10 @@ def main(argv: list[str], gh: Callable[..., str] = run_gh) -> int:
 def _exit_status(code: object) -> int:
     if code is None:
         return 0
-    return code if isinstance(code, int) and 0 <= code <= 255 else 1
+    if issubclass(type(code), int) and isinstance(code, int):
+        value = int.__index__(code)
+        return value if 0 <= value <= 255 else 1
+    return 1
 
 
 def _cli(argv: list[str]) -> int:
