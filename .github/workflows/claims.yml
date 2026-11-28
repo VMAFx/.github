@@ -65,7 +65,7 @@ jobs:
           persist-credentials: false
 
       - name: Lint the profile and prove the rule
-        uses: docker://jdkato/vale:v3.26.0@sha256:d4ebc402b255dacc759c468ed8c91bd5be82918bbb59583558539f3be80f1f01
+        uses: docker://jdkato/vale:v3.28.1@sha256:42b74f7f3ea7dd60554181037a8899a190516b9d48b67d157b09e5df791f9115
         with:
           entrypoint: /bin/sh
           args: scripts/check-claims.sh
